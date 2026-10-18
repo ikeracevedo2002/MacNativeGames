@@ -28,6 +28,9 @@ This is not a conventional full-system emulator. It is a native host runtime plu
 
 See [GOAL.md](GOAL.md) for acceptance criteria and [PORTING_PLAN.md](PORTING_PLAN.md) for the staged plan.
 
+Windows build/run instructions for the G1 build-skeleton row live in
+[docs/windows-build.md](docs/windows-build.md).
+
 ## Current source architecture
 
 The working Mac port has four major pieces:

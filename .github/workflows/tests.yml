@@ -9,6 +9,8 @@ permissions:
   contents: read
 
 jobs:
+  # Original Mac job: keeps the legacy id "test" so existing branch
+  # protection / required-status-checks settings keep matching.
   test:
     runs-on: macos-latest
     timeout-minutes: 10
@@ -29,3 +31,52 @@ jobs:
         run: |
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/test_romfs_paths.c -o "$RUNNER_TEMP/test-romfs-paths"
           "$RUNNER_TEMP/test-romfs-paths"
+
+  # G1 build-skeleton row on Windows x64. Other G1 items (VM, timing,
+  # TLS, threads, faults) and all later milestones remain NOT STARTED.
+  windows-x64-skeleton:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    # Build directory is outside both the runner work-tree and the
+    # source tree (D006).
+    env:
+      BUILD_DIR: ${{ runner.temp }}\mn-build-x64
+      REJECT_BUILD_DIR: ${{ runner.temp }}\mn-reject-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # Visual Studio's bundled CMake is on PATH for hosted windows-latest
+      # runners; the VS generator auto-detects the MSVC toolchain without
+      # requiring an explicit VsDevCmd call.
+      - name: Configure (Visual Studio generator, AMD64)
+        shell: cmd
+        run: cmake -S . -B "%BUILD_DIR%" -A x64
+      - name: Build (Debug)
+        shell: cmd
+        run: cmake --build "%BUILD_DIR%" --config Debug
+      - name: ctest (Debug)
+        shell: cmd
+        run: ctest --test-dir "%BUILD_DIR%" -C Debug --output-on-failure
+      - name: Reject unsupported target (external build dir)
+        # The CMAKE_SIZEOF_VOID_P guard in CMakeLists.txt must fire when
+        # the project is configured for a 32-bit target. CMAKE_SYSTEM_PROCESSOR
+        # is host-derived under the VS generator, so spoofing it is not
+        # a real test; the Win32 target forces the actual sizeof(void *)
+        # to 4, which the guard detects. The build dir lives outside the
+        # source tree so no source-tree cache is created.
+        shell: cmd
+        run: |
+          cmake -S . -B "%REJECT_BUILD_DIR%" -A Win32 > "%REJECT_BUILD_DIR%.log" 2>&1
+          if errorlevel 1 (
+            findstr /C:"supports ONLY 64-bit pointers" "%REJECT_BUILD_DIR%.log" >nul
+            if errorlevel 1 (
+              echo UNEXPECTED: configure rejected but no pointer-size error found
+              type "%REJECT_BUILD_DIR%.log"
+              exit /b 1
+            )
+          ) else (
+            echo UNEXPECTED: 32-bit target configure was accepted; the guard did not fire
+            type "%REJECT_BUILD_DIR%.log"
+            exit /b 1
+          )

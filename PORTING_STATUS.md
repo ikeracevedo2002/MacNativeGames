@@ -9,7 +9,7 @@ Do not mark a row VALIDATED because it compiles. Add evidence that satisfies the
 | Area | Status | Exit condition / evidence |
 |---|---|---|
 | Project documentation | VALIDATED | Goal, architecture, plan, decisions and agent rules created |
-| Windows build skeleton | NOT STARTED | Win-x64 host executable builds and runs a no-game-data probe |
+| Windows build skeleton | VALIDATED (build-skeleton row only) | `CMakeLists.txt` rejects non-Windows, non-AMD64, in-source and source-subdirectory builds at configure time. `-A Win32` was driven locally to confirm the `CMAKE_SIZEOF_VOID_P=4` guard fires with `cmake` exit `1` and the message `supports ONLY 64-bit pointers`. `host_check.exe` builds with MSVC `cl.exe` (Visual Studio generator, C11, `/W4`) on Windows 10/11 x86-64 and enforces `_WIN64` + `_M_AMD64` + `sizeof(void *) == 8` at compile time. CTest passes locally (3/3): `host_check_default` (exit 0, prints `PASS: host architecture satisfied`), `host_check_negative_control` (verifier requires exact exit `1` and the exact diagnostic line `[negative-control] FAIL: expected pointer width 4 byte(s), got 8` against the real host), `romfs_path_cases` (unchanged `tests/test_romfs_paths.c` returns `PASS: 27 RomFS path cases`). Build-dir paths containing spaces were tested locally. Direct invocations of `host_check.exe`, `host_check.exe --negative-control`, and `romfs_probe.exe` match the contracted exit codes and outputs. This row does NOT cover VM, timing, TLS, threads, faults, loader, AOT translation, NVN, audio, controller, frontend or packaging; those rows remain NOT STARTED. CI is configured but the workflow has not been executed on a hosted runner from this branch. |
 | Platform VM abstraction | NOT STARTED | Reserve/commit/protect/map tests pass on Windows |
 | Timing/TLS abstraction | NOT STARTED | Monotonic clock + TLS probes pass |
 | Thread/sync abstraction | NOT STARTED | Thread lifecycle/wait/wake probes pass |
@@ -43,13 +43,13 @@ Do not mark a row VALIDATED because it compiles. Add evidence that satisfies the
 ## Current blockers
 
 1. No AOT ARM64 -> x86-64 execution layer exists yet.
-2. Windows platform wrappers do not exist yet.
+2. Windows platform wrappers do not exist yet (VM, timing, TLS, threads, faults).
 3. Windows graphics backend is not selected or implemented.
 
 ## Next recommended work
 
 1. Produce a machine-readable inventory of Apple-specific/ARM64-specific source dependencies.
 2. Define the translated guest register-state ABI.
-3. Build the smallest Windows x64 host/probe.
+3. Begin porting the remaining G1 platform wrappers (VM, timing, TLS, threads, faults).
 4. In parallel, run a tightly scoped Vulkan-vs-D3D12 graphics spike.
 5. Begin AOT translation with generated instruction fixtures, not TOTK as the first test case.
