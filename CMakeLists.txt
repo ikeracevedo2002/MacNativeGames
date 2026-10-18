@@ -7,13 +7,17 @@
 #   - compiles the small host_check host executable
 #   - compiles the narrow host monotonic-clock library (timing row) and
 #     its deterministic conversion tests plus live Windows probe
+#   - compiles the narrow host TLS slot library (TLS row) and its
+#     lifecycle/isolation probe, which also rejects fixture-only wrong
+#     backends with the same battery
 #   - registers a CTest suite whose negative-control test verifies BOTH
 #     the exact non-zero exit code AND the explicit diagnostic via
 #     tests/verify_host_negative_control.cmd
 #
 # What this project does NOT do (G1 is broader than this; see
-# PORTING_STATUS.md): VM, TLS, threads, loader, AOT translation,
-# graphics, audio, controller, frontend, packaging.
+# PORTING_STATUS.md): VM, threads/synchronisation, guest TLS or its ABI,
+# loader, AOT translation, graphics, audio, controller, frontend,
+# packaging.
 
 cmake_minimum_required(VERSION 3.20)
 project(MacNativeGamesWinX64 LANGUAGES C)
@@ -109,6 +113,21 @@ add_executable(host_time_probe
 )
 target_link_libraries(host_time_probe PRIVATE host_time)
 
+# TLS row: narrow host TLS slot library. host_tls.c owns the Windows
+# TlsAlloc/TlsGetValue/TlsSetValue/TlsFree calls; host_tls.h stays free of
+# <windows.h> and of any guest TLS/ABI concept.
+add_library(host_tls STATIC
+    src/host_tls.c
+)
+target_include_directories(host_tls PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# Lifecycle + real-thread isolation probe. It runs one battery against the
+# real backend and against fixture-only wrong backends; exit status only.
+add_executable(host_tls_probe
+    tests/host_tls_probe.c
+)
+target_link_libraries(host_tls_probe PRIVATE host_tls)
+
 # ---- Tests --------------------------------------------------------------
 
 enable_testing()
@@ -149,3 +168,12 @@ add_test(NAME host_time_live_probe
     COMMAND host_time_probe
 )
 set_tests_properties(host_time_live_probe PROPERTIES TIMEOUT 60)
+
+# Host TLS slot probe. Exit status only: it fails when the real backend
+# misses a contract check OR when the same battery accepts a deliberately
+# wrong backend. Every phase gate and thread join has its own bounded wait;
+# this TIMEOUT only guards against a genuinely wedged process.
+add_test(NAME host_tls_slot_probe
+    COMMAND host_tls_probe
+)
+set_tests_properties(host_tls_slot_probe PROPERTIES TIMEOUT 180)

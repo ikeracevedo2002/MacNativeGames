@@ -32,10 +32,11 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/test_romfs_paths.c -o "$RUNNER_TEMP/test-romfs-paths"
           "$RUNNER_TEMP/test-romfs-paths"
 
-  # G1 build-skeleton + host timing rows on Windows x64. The CTest suite
-  # covers the build skeleton, the host monotonic clock conversion/live
-  # probes and the RomFS path probe. Other G1 items (VM, TLS, threads,
-  # faults) and all later milestones remain NOT STARTED.
+  # G1 build-skeleton + host timing + host TLS rows on Windows x64. The
+  # CTest suite covers the build skeleton, the host monotonic clock
+  # conversion/live probes, the host TLS slot lifecycle/isolation probe
+  # and the RomFS path probe. Other G1 items (VM, thread/synchronisation,
+  # faults, guest TLS/ABI) and all later milestones remain NOT STARTED.
   windows-x64-skeleton:
     runs-on: windows-latest
     timeout-minutes: 10

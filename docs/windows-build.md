@@ -1,6 +1,6 @@
-# Windows x86-64 build (G1 build-skeleton + host timing rows)
+# Windows x86-64 build (G1 build-skeleton + host timing + host TLS rows)
 
-This document covers two narrow G1 rows on the `windows-x86-port`
+This document covers three narrow G1 rows on the `windows-x86-port`
 branch:
 
 * the **build-skeleton row**: a small Windows x86-64 host executable,
@@ -10,16 +10,22 @@ branch:
   line printed by the host;
 * the **host timing row**: a narrow Windows `QueryPerformanceCounter`
   monotonic-nanosecond primitive with deterministic conversion tests and
-  a live Windows probe (see "G1 host monotonic clock" below).
+  a live Windows probe (see "G1 host monotonic clock" below);
+* the **host TLS row**: a narrow Windows TLS *slot lifecycle* primitive
+  (`src/host_tls.h` / `src/host_tls.c`) with a lifecycle + real-thread
+  isolation probe that also rejects fixture-only wrong backends (see
+  "G1 host TLS slots" below). It is host TLS only: no guest TLS/TLR, no
+  thread-environment object, no key destructor and no guest ABI.
 
-It explicitly does **not** cover: VM, TLS, threads, fault handling, AOT
-translation, the translated module loader, Horizon services, audio,
-controller, frontend, graphics, packaging, or a reproducible build of
-the full game. Those rows stay `NOT STARTED` / `RESEARCH` in
-`../PORTING_STATUS.md` until later work satisfies their individual exit
-conditions. In particular, the timing row validates the host monotonic
-clock only; the combined **Timing/TLS** exit condition is still open
-because no TLS abstraction exists yet.
+It explicitly does **not** cover: VM, threads/synchronisation, fault
+handling, AOT translation, the translated module loader, guest TLS/TLR
+and its ABI, Horizon services, audio, controller, frontend, graphics,
+packaging, or a reproducible build of the full game. Those rows stay
+`NOT STARTED` / `RESEARCH` in `../PORTING_STATUS.md` until later work
+satisfies their individual exit conditions. In particular, the TLS row
+validates the **host** slot lifecycle against real OS threads; it does
+not implement the guest TLS/TLR mechanism, the Mac thread environment or
+its destructor.
 
 There are now **two** independent build paths in the repository:
 
@@ -28,8 +34,8 @@ There are now **two** independent build paths in the repository:
   playable game until later Windows rows close.
 * **Windows x86-64 (these rows only)** — `CMakeLists.txt`, builds the
   small host executable, the unchanged RomFS probe, the host monotonic
-  clock library and its conversion/live tests. It does not produce a
-  runnable game.
+  clock library and its conversion/live tests, and the host TLS slot
+  library and its probe. It does not produce a runnable game.
 
 ## Scope matrix for this row
 
@@ -48,12 +54,14 @@ the AMD64 box reproduced the expected behaviour). Statuses without
 | Negative-control harness with exact exit code 1 plus exact diagnostic-line match | VALIDATED (T) — see "Verifier self-check" below |
 | RomFS probe built and run unchanged           | VALIDATED (T) — `tests/test_romfs_paths.c`        |
 | Host monotonic clock library + deterministic conversion tests | VALIDATED (T) — 20 fixed cases + 5 rejected negative controls |
-| Live host clock probe (nondecreasing + unit scale) | VALIDATED (T) — Debug and Release CTest 5/5 |
-| TLS abstraction                               | NOT STARTED — not part of the timing row            |
+| Live host clock probe (nondecreasing + unit scale) | VALIDATED (T) — Debug and Release CTest |
+| Host TLS slot library + lifecycle/isolation probe | VALIDATED (T) — host slots only; 5 rejected negative backends |
+| Guest TLS/TLR, thread environment, key destructors, guest ABI | NOT STARTED — outside every row so far |
 
-Other G1 platform wrappers (memory, TLS, threads, faults) and every
-later milestone (G2..G8) are explicitly NOT STARTED. The timing row
-below covers only the host monotonic clock.
+Other G1 platform wrappers (memory, threads/synchronisation, faults)
+and every later milestone (G2..G8) are explicitly NOT STARTED. The
+timing row below covers only the host monotonic clock; the TLS row
+covers only the host TLS slot lifecycle.
 
 ## G1 host monotonic clock (timing row)
 
@@ -149,9 +157,10 @@ ctest --test-dir "C:\Users\IKER\mn time build\debug" -C Debug --output-on-failur
 
 Local results (MSVC 19.51, VS 18):
 
-* Debug: 5/5 CTest pass (existing 3 + `host_time_convert_cases` +
-  `host_time_live_probe`).
-* Release: 5/5 CTest pass.
+* Debug: 5/5 CTest pass at the time of the timing row (existing 3 +
+  `host_time_convert_cases` + `host_time_live_probe`). The suite now also
+  contains `host_tls_slot_probe`; the current total is 6/6 (see the TLS row).
+* Release: 5/5 CTest pass at the time of the timing row (6/6 today).
 * `host_time_convert_test.exe`: `PASS: 20 conversion cases + 5 negative
   controls`.
 * `host_time_probe.exe`: elapsed inside the reference interval, e.g.
@@ -165,12 +174,233 @@ MSVC-built conversion 343,839 times (boundary pairs, seeded random
 smaller 1,000-case randomized oracle also passed. The committed fixtures
 above are the regression suite.
 
-Limitations: no suspend/standby test, no cross-thread ordering test, no
-TLS (so the combined Timing/TLS exit condition is still incomplete), and
-this is not a guest clock. The non-MSVC `__int128` fallback in the
+Limitations: no suspend/standby test, no cross-thread ordering test, and
+this is not a guest clock. Host TLS slots are covered by the separate TLS
+row below; guest TLS/TLR is not covered anywhere yet. The non-MSVC `__int128` fallback in the
 conversion helper exists for portability but is not locally validated;
 the tested path is MSVC x64. Hosted CI has not been executed from this
 branch.
+
+## G1 host TLS slots (TLS row)
+
+This row adds a narrow **host** thread-local-storage slot primitive only.
+It does not implement the guest TLS/TLR mechanism, the Mac thread
+environment, any key destructor or the translated-code (AOT) ABI. The Mac
+sources are unchanged.
+
+### Mac reference (behavioural source, not code to port)
+
+`games/totk/runtime/loader.c`:
+
+* `runtime_thread_init()` allocates a per-thread `ThreadEnvironment` and
+  binds it with `pthread_setspecific(environment_key, e)`, then binds the
+  per-thread gate/TLS/TLR pointers into `runtime_keys[0..3]`;
+* `thread_cleanup()` clears `environment_key` and `runtime_keys[0..3]` and
+  then runs `environment_destroy(e)` explicitly;
+* `main()` creates `runtime_keys[8]` with `pthread_key_create(..., NULL)`
+  (no destructor) and `environment_key` with
+  `pthread_key_create(..., environment_destroy)` (destructor);
+  `runtime_hle_stack_init()` turns `runtime_keys[4]` into the Darwin TSD
+  offset `key * 8`.
+
+`games/totk/runtime/threads.c` binds a `thr_t` to the current thread
+through `g_keythr`, also created with a NULL destructor.
+
+What this row takes: the host TLS slot lifecycle used by the
+destructor-less keys (`runtime_keys[]`, `g_keythr`) — create, per-thread
+get, per-thread set/replace, clear and release, with explicit errors and
+no automatic release of the stored pointer.
+
+What this row excludes on purpose:
+
+* `environment_key` has a destructor and is therefore **outside** this
+  contract. Thread-environment teardown stays an explicit caller step for
+  a later boundary; no destructor hook exists in this API;
+* the ThreadEnvironment struct and its ownership;
+* the raw Darwin TSD layout (`TPIDRRO_EL0 + key * 8`) and the guest key
+  page. Those are ARM64/Darwin details and are neither preserved nor
+  exposed as a Windows ABI;
+* guest TLS/TLR values, guest handles, and any guest register/AOT ABI.
+
+### API (`src/host_tls.h`, Windows backend `src/host_tls.c`)
+
+| Function | Contract |
+|---|---|
+| `host_tls_slot_init(slot)` | Required once before the first create(); rejects a live slot; returns the handle to a ready state. |
+| `host_tls_slot_create(slot)` | Allocates a native TLS index (may be 0). On failure the handle is untouched and still ready. |
+| `host_tls_slot_destroy(slot)` | Releases the index of a live slot after quiescence. On failure the slot stays live. |
+| `host_tls_get(slot, *out)` | Per-thread read. `*out == NULL` on success means "no value on this thread" and is not an error. On failure `*out` is untouched. |
+| `host_tls_set(slot, value)` | Per-thread store or replace; `value == NULL` clears. |
+
+`host_tls_result` is `HOST_TLS_OK`, `HOST_TLS_ERR_INVALID_ARGUMENT`
+(NULL slot / NULL output), `HOST_TLS_ERR_INVALID_STATE` (lifecycle
+misuse: create without init, create twice, init on a live slot, any
+get/set/destroy on an uninitialised or destroyed slot),
+`HOST_TLS_ERR_ALLOCATION` (TlsAlloc refused a new index) or
+`HOST_TLS_ERR_PLATFORM` (TlsGetValue/TlsSetValue/TlsFree failure).
+
+Semantics and preconditions (documented in the header):
+
+* storage is per operating-system thread; a new thread starts with NULL
+  and an exited thread does not hand its values to a fresh thread.
+  Microsoft documents that `TlsAlloc` initializes the storage slots for the
+  new index to zero ("The slots for the index are initialized to zero"), so
+  the NULL initial state is a property of index **creation**, not of
+  `TlsFree`; the row does not rely on `TlsFree` clearing per-thread
+  storage. Source:
+  <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-tlsalloc>;
+* the stored `void *` is **caller-owned**: no destructor runs, nothing is
+  freed on clear or destroy;
+* `create()`/`destroy()` are not internally synchronised, and `destroy()`
+  requires prior quiescence of every thread that can still use the slot;
+* a live slot must not be copied: there is no registry, no generation
+  counter and no anti-stale-copy protection;
+* native index 0 is a valid slot, never a falsey sentinel: validity lives
+  in the handle's lifecycle tag.
+
+### Probe (`tests/host_tls_probe.c`)
+
+One battery runs twice: first against the real backend (every check must
+pass), then against five fixture-only wrong backends (each must be
+rejected by the SAME battery). The product header exposes no hook for
+this; the seam is a small function table inside the fixture.
+
+Checks: NULL arguments, lifecycle misuse with handle-field snapshots (a
+failing init/create/destroy must leave the handle unchanged), output
+sentinel checks on failing get, initial NULL, set/replace/clear, two and
+four simultaneous slots staying independent, destroy + recreate, and
+real `CreateThread` isolation phases driven by manual-reset events (no
+sleeps make a phase deterministic): main + two workers hold distinct
+values at once, each sees only its own, a replacement or clear in one
+thread does not disturb the others, and a writer thread that exits
+without clearing is followed by a fresh reader on the same live slot
+that must see NULL. Eight rounds of that protocol.
+
+Infrastructure failures (CreateEvent/CreateThread failure, phase-gate
+timeout, join timeout, or `HOST_TLS_ERR_ALLOCATION` where success is
+required — no fixture backend injects allocation failure) are not check
+failures: the harness prints `FATAL: ...` and terminates the process
+immediately with `ExitProcess(1)`, without closing handles or reading
+results from a thread that may still be running. A harness failure can
+therefore never be reported as "the negative backend was rejected" — the
+CTest case just fails. The process-global negative's fixture table
+likewise aborts the probe when full instead of returning a fake error, so
+it cannot mutate a handle or be miscounted as a rejection.
+
+Negative backends and their expected rejection profile:
+
+| Backend | Defect | Must pass sequential |
+|---|---|---|
+| `negative-process-global-storage` | value store is process-global **per slot** instead of per thread (passes single-threaded use exactly) | yes; must fail only the thread checks |
+| `negative-aliased-slots` | every slot aliases one shared TLS storage | no (fails slot independence) |
+| `negative-clear-noop` | `set(NULL)` is silently ignored | no |
+| `negative-output-clobber` | a failing get writes to the output first | no |
+| `negative-null-is-error` | an empty slot is reported as a platform failure | no |
+
+The fixture's own cross-thread state is serialised (SRWLOCK in the
+process-global negative, a single real TLS index in the aliasing one), so
+the negatives add no data race of their own. Failures are split into
+sequential and thread-phase counters, and the process-global negative is
+required to have `0` sequential failures — otherwise the probe fails, so
+it cannot be "rejected" for an unintended, easier-to-spot defect.
+
+Exit status is the result: no `PASS_REGULAR_EXPRESSION`, no `WILL_FAIL`
+and no `assert()`. CTest applies an external 180 s timeout on top of the
+bounded waits inside the probe.
+
+### Local evidence and commands
+
+External build dirs (with spaces) and the Visual Studio 18 generator:
+
+```cmd
+cmake -S "<repo>" -B "C:\Users\IKER\mn tls build\debug" -G "Visual Studio 18 2026" -A x64
+cmake --build "C:\Users\IKER\mn tls build\debug" --config Debug
+ctest --test-dir "C:\Users\IKER\mn tls build\debug" -C Debug --output-on-failure
+:: same for -C Release in "C:\Users\IKER\mn tls build\release"
+```
+
+Local results (MSVC 19.51, VS 18, `/W4`, no warnings):
+
+* Debug: 6/6 CTest pass. Release: 6/6 CTest pass.
+* `host_tls_probe.exe` (Debug and Release, exit 0):
+
+```
+[coverage] the first real slot received native index 1; no native index 0 was observed, so the zero-index path was not exercised (no foreign index is freed to force it)
+checked: 'negative-process-global-storage' rejected by 0 sequential + 17 thread check(s)
+checked: 'negative-aliased-slots' rejected by 8 sequential + 2 thread check(s)
+checked: 'negative-clear-noop' rejected by 3 sequential + 4 thread check(s)
+checked: 'negative-output-clobber' rejected by 3 sequential + 0 thread check(s)
+checked: 'negative-null-is-error' rejected by 5 sequential + 12 thread check(s)
+PASS: host TLS slot battery (8 thread rounds, zero-native-index not observed) and 5 rejected negative backends
+```
+
+The exact thread-phase counts for `negative-process-global-storage` move by a
+unit or two between runs (17 and 18 were both observed) because they depend
+on which participant's value happened to be stored last, but the rejection
+itself and the split are invariant: `0` sequential failures (the defect must
+look correct to a single thread) and at least one thread-phase failure. The
+acceptance logic uses only `> 0` and the split, never a count, so this does
+not make the probe order-dependent.
+
+Additional out-of-tree local evidence (**not** a committed regression
+test, and no external artefact is stored in this repository): an
+external audit program (`audit.c`, built with `/W4 /WX` against the same
+`src/host_tls.c`) drives a **real** `TlsAlloc` exhaustion. Debug and
+Release both pass with exit 0:
+
+```
+PASS: allocation exhaustion after 1086 live slots; unchanged handle, retry, survivor values and cleanup (0 failures)
+```
+
+That audit shows, on a genuine platform failure: exhaustion is reported
+as `HOST_TLS_ERR_ALLOCATION`, the failed handle is unchanged and still
+ready, freeing one index lets that same handle retry successfully (and
+the new slot reads NULL), previously stored values in the surviving
+slots are intact, and all slots can then be destroyed. It is recorded as
+evidence only; the committed probe deliberately does not force platform
+failures.
+
+Repetition evidence (out-of-tree logs, not committed): a lead rerun of
+`ctest -R "^host_tls_slot_probe$" --repeat until-fail:100` in both the Debug
+and the Release build dirs finished with ctest exit `0` and `100/100`
+passes in each configuration (`Start 6` × 100, `Passed` × 100, `100% tests
+passed, 0 tests failed out of 1`). This is repetition stability evidence
+for the thread-phase protocol; it adds no new exit condition.
+
+`HOST_TLS_ERR_ALLOCATION`-on-required-success evidence (out-of-tree, not
+committed): a review harness includes the probe with `main` renamed and
+calls `expect_result(HOST_TLS_ERR_ALLOCATION, HOST_TLS_OK)` directly.
+Built with `/W4 /WX` in Debug and Release, both terminate with exit code
+exactly `1`, empty stdout and the exact stderr line
+
+```
+FATAL: probe infrastructure failed: a native TLS index allocation failed where success was required
+```
+
+so a real allocation failure aborts the probe and can never be counted as
+a rejected negative backend.
+
+### Limitations
+
+* **Native index 0 is not observed in the local runs.** The first real slot
+  received native index 1 and no slot received 0, so that path is
+  documented, not exercised. Validity is the lifecycle tag and never the
+  index value, and no foreign index is freed to manufacture an index-0 slot.
+  That index 0 was never handed out here is reported as an observation of
+  these runs only, not as a platform guarantee or an unreachability claim.
+* `TlsGetValue` / `TlsSetValue` / `TlsFree` failure paths are implemented
+  and mapped to `HOST_TLS_ERR_PLATFORM`. `TlsAlloc` exhaustion is exercised
+  by the out-of-tree audits below, not by the committed probe; the
+  committed probe also does not force get/set/free platform errors (an
+  invalid-index get/free failure would require violating the lifecycle
+  preconditions, and a `TlsSetValue`
+  `ERROR_NOT_ENOUGH_MEMORY` failure is not manufactured).
+* No guest TLS/TLR, no thread environment, no key destructor, no guest
+  key page, no guest register/AOT ABI and no integration with
+  `runtime_keys[]` / `g_keythr` (the Mac code stays untouched).
+* The API is not a synchronisation primitive and is not a thread
+  lifecycle API: it does not create, start, join or wake threads. The
+  thread/synchronisation row remains `NOT STARTED`.
 
 ## Toolchain requirements
 
@@ -220,6 +450,9 @@ echo host_time_convert_test exit=%ERRORLEVEL%
 "%TEMP%\mn-build-x64\Debug\host_time_probe.exe"
 echo host_time_probe exit=%ERRORLEVEL%
 
+"%TEMP%\mn-build-x64\Debug\host_tls_probe.exe"
+echo host_tls_probe exit=%ERRORLEVEL%
+
 :: 6. Verify the unsupported-target guard (Win32) fires locally.
 cmake -S "%CD%" -B "%TEMP%\mn-reject-win32" -A Win32 > "%TEMP%\mn-reject-win32.log" 2>&1
 if errorlevel 1 (
@@ -242,6 +475,7 @@ reverse order leaves stderr on the terminal and produces a silent
 | `romfs_probe.exe`                        | 0             | stdout: `PASS: 27 RomFS path cases`                            |
 | `host_time_convert_test.exe`             | 0             | stdout: `PASS: 20 conversion cases + 5 negative controls`      |
 | `host_time_probe.exe`                    | 0             | stdout: `PASS: live host monotonic clock + scale check; negative controls rejected (...)` |
+| `host_tls_probe.exe`                     | 0             | stdout: five `checked: '<negative>' rejected by ...` lines then `PASS: host TLS slot battery (...)`; the `[coverage]` line is on stdout when native index 0 was observed and on stderr otherwise |
 | `cmake ... -A Win32`                     | non-zero      | configure error containing `supports ONLY 64-bit pointers`    |
 
 The negative-control failure is deliberate: it proves the runtime
@@ -271,8 +505,9 @@ scope for this row.
 
 * No virtual-memory abstraction (`VirtualAlloc` page-protection
   tests remain `NOT STARTED`).
-* No TLS abstraction. The host monotonic clock is covered by the timing
-  row above; the combined Timing/TLS exit condition is still open.
+* No guest TLS/TLR, no thread environment, no key destructor and no
+  guest TLS/register ABI. The TLS row above covers the **host** TLS slot
+  lifecycle (and only that).
 * No thread pool or synchronisation primitives.
 * No fault / vectored-exception handling probe.
 * No translated-module loader.
@@ -287,6 +522,7 @@ scope for this row.
 * No 1.1.2 / 1.4.3 work.
 
 Treat these rows as evidence that the Windows x86-64 configure / build /
-test path and the host monotonic clock are plausible end-to-end. Do not
-mark TLS, VM, threads, faults, downstream G1 or G2..G8 rows complete
-based on them.
+test path, the host monotonic clock and the host TLS slot lifecycle are
+plausible end-to-end. Do not mark VM, threads/synchronisation, fault
+handling, guest TLS/TLR, downstream G1 or G2..G8 rows complete based on
+them.
