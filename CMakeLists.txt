@@ -5,12 +5,14 @@
 #   - refuses in-source and source-subdirectory build dirs
 #   - compiles the platform-neutral RomFS path probe unmodified
 #   - compiles the small host_check host executable
+#   - compiles the narrow host monotonic-clock library (timing row) and
+#     its deterministic conversion tests plus live Windows probe
 #   - registers a CTest suite whose negative-control test verifies BOTH
 #     the exact non-zero exit code AND the explicit diagnostic via
 #     tests/verify_host_negative_control.cmd
 #
-# What this project does NOT do (G1 is broader than this row; see
-# PORTING_STATUS.md): VM, timing, TLS, threads, loader, AOT translation,
+# What this project does NOT do (G1 is broader than this; see
+# PORTING_STATUS.md): VM, TLS, threads, loader, AOT translation,
 # graphics, audio, controller, frontend, packaging.
 
 cmake_minimum_required(VERSION 3.20)
@@ -85,6 +87,28 @@ add_executable(host_check
     src/host_check.c
 )
 
+# Timing row: narrow host monotonic-clock library. host_time_convert.c is
+# pure integer/C with no Win32 dependency so the scaling is independently
+# testable; host_time.c owns the QueryPerformanceCounter read.
+add_library(host_time STATIC
+    src/host_time.c
+    src/host_time_convert.c
+)
+target_include_directories(host_time PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# Deterministic conversion tests (fixed constants + own negative controls).
+add_executable(host_time_convert_test
+    tests/test_host_time_convert.c
+)
+target_link_libraries(host_time_convert_test PRIVATE host_time)
+
+# Live Windows probe: nondecreasing reads + positive, correctly-scaled
+# elapsed time against an independent GetTickCount64 reference.
+add_executable(host_time_probe
+    tests/host_time_probe.c
+)
+target_link_libraries(host_time_probe PRIVATE host_time)
+
 # ---- Tests --------------------------------------------------------------
 
 enable_testing()
@@ -112,3 +136,16 @@ add_test(NAME host_check_negative_control
 add_test(NAME romfs_path_cases
     COMMAND romfs_probe
 )
+
+# Deterministic clock-conversion tests. Exit status only; the executable
+# itself fails if its checker accepts a deliberately wrong implementation.
+add_test(NAME host_time_convert_cases
+    COMMAND host_time_convert_test
+)
+
+# Live host clock probe. Exit status only. A generous external CTest
+# timeout guards against a hung wait; the probe is not a benchmark.
+add_test(NAME host_time_live_probe
+    COMMAND host_time_probe
+)
+set_tests_properties(host_time_live_probe PROPERTIES TIMEOUT 60)
