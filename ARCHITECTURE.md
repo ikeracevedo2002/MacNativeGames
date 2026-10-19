@@ -82,16 +82,32 @@ The translator must preserve:
 
 The host runtime needs a defined **guest register state ABI** for calls into SVC/HLE helpers. The existing ARM64 gate layout is a useful semantic reference, not reusable x64 code.
 
-**Scoped G2 proof status (D010/D011).** A finite-subset offline C-translation
-path now exists and is opt-in (`-DMN_BUILD_AOT_PROOF=ON`; see
+**Scoped G2 proof status (D010/D011/D012/D013).** A finite-subset offline
+C-translation path now exists and is opt-in (`-DMN_BUILD_AOT_PROOF=ON`; see
 `docs/g2-aot-proof.md`). It defines the owned `AotGuestState` ABI (816 B,
-8-byte aligned), typed native block exits with the runtime owning PC, and a
-registered typed native HLE handler (host->guest callbacks/reentry are not
-supported). It is verified by a Capstone-derived CFG plus a pinned Unicorn
-A57 differential oracle with real-lowering negative controls. **Full G2 is not
-closed**: it does not cover numerical FP/FPCR/FPSR semantics or
-atomics/ordering (a runtime fault policy is a separate G3 row), and the global
-translated-code backend choice (D008) remains OPEN.
+8-byte aligned; unchanged by the subset expansion), typed native block exits
+with the runtime owning PC, a registered typed native HLE handler
+(host->guest callbacks/reentry are not supported), a software numeric FP model
+(F32/F64 add/sub/mul/div/fcmp/fcmpe over RN/RP/RM/RZ/DN/FZ with sticky FPSR
+and an explicit unsupported-FPCR fault before any write), and a serialized
+sequentially-consistent arena/exclusive-monitor model (SC is deliberately
+stronger than the guest's weak model; barriers are therefore not valid
+negative mutants). It is verified by an independent Capstone-derived
+reachable CFG and a pinned Unicorn A57 differential oracle with real-lowering
+and callback negative controls. The concurrency fixture uses exact per-chunk
+ranges; the differential fixture declares a containing range with unreachable
+padding.
+
+**G2 evaluation (lead, local):** the GOAL.md G2 / Plan Phase 1
+*controlled-fixture* exit conditions are **SATISFIED LOCALLY** and G2 is
+recorded **CLOSED/VALIDATED for the controlled proof only** — not full-ISA,
+not title/game and not backend parity. The area rows are therefore VALIDATED
+in `PORTING_STATUS.md` for their controlled subsets. The full-module
+translated-code backend (D008) and the graphics backend (D007) stay **OPEN**;
+G3 module loading/linking and its runtime fault/exception prerequisite
+remain **NOT STARTED**; real game boot belongs to later G4/G6 gates and has
+not begun. The candidate is uncommitted (main checkout on branch `windows-x86-port`,
+clean at `0a30a282`) and requires explicit user approval before integration.
 
 ### Memory model
 

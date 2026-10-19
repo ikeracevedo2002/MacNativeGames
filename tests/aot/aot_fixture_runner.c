@@ -49,8 +49,15 @@ int main(void) {
     memset(arena, 0, ARENA_SIZE);
 
     AotMem mem;
-    if (aot_mem_init(&mem, arena, ARENA_SIZE, GUEST_BASE) != AOT_MEM_OK) {
+    AotMemDomain *dom = aot_mem_domain_create();
+    if (dom == NULL) {
+        printf("FAIL: aot_mem_domain_create\n");
+        free(arena);
+        return 1;
+    }
+    if (aot_mem_init(&mem, dom, arena, ARENA_SIZE, GUEST_BASE) != AOT_MEM_OK) {
         printf("FAIL: aot_mem_init\n");
+        aot_mem_domain_destroy(dom);
         free(arena);
         return 1;
     }
@@ -62,14 +69,17 @@ int main(void) {
     state.nzcv = AOT_NZCV_PACK(0, 1, 0, 0);
 
     AotRuntime rt;
+    memset(&rt, 0, sizeof(rt));
     uint32_t rc = aot_rt_init(&rt, &aot_image_fixture, mem, &state, 100000u);
     if (rc != AOT_FAULT_NONE) {
         printf("FAIL: aot_rt_init rc=%u\n", rc);
+        aot_mem_domain_destroy(dom);
         free(arena);
         return 1;
     }
     if (aot_rt_set_handler(&rt, AOT_HLE_SVC, 0x40u, svc_handler, NULL) != 0) {
         printf("FAIL: aot_rt_set_handler\n");
+        aot_mem_domain_destroy(dom);
         free(arena);
         return 1;
     }
@@ -104,6 +114,8 @@ int main(void) {
                (unsigned long long)state.x[0], (unsigned long long)state.x[3],
                (unsigned long long)state.x[5], (unsigned long long)g_svc_id);
     }
+    aot_rt_release(&rt);
+    aot_mem_domain_destroy(dom);
     free(arena);
     return bad ? 1 : 0;
 }

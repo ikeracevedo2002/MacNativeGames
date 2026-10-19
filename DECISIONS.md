@@ -135,8 +135,10 @@ while avoiding committing to a global backend (D008) prematurely.
 
 Consequences: STOP is only legal immediately after RET (a proof-harness
 sentinel, not a guest thread-exit ABI); numeric FP/FPCR/FPSR semantics and
-atomics/ordering remain PLAN, and a runtime fault policy is a separate G3 row
-(not a G2 exit condition).
+atomics/ordering were PLAN at the time of this entry and are now specified,
+within the controlled proof scope, by the superseding D012 and D013 (this
+entry's ABI/HLE design is unchanged); a runtime fault policy is a separate G3
+row (not a G2 exit condition).
 
 ## D011 — The C-backend AOT proof is scoped evidence, not the module backend
 
@@ -154,6 +156,87 @@ translator or benchmark.
 
 Consequences: the generated-C SHA256 is a config/image fingerprint, **not**
 the real G3 exact-version loader source hash. The full-module backend choice
-(D008) is deliberately left open; FP/atomic architecture and any LLVM vs
-direct-x64 backend comparison are future work. This decision must not be read
+(D008) is deliberately left open; the FP/atomic architecture left open here is
+now specified for the controlled proof scope by D012/D013 (they supersede only
+that PLAN consequence, not this decision), and any LLVM vs direct-x64 backend
+comparison remains future work. This decision must not be read
 as an implicit acceptance of a global backend.
+
+## D012 — Scoped numeric/bitwise FP semantics for the G2 proof
+
+**Status:** Accepted (scoped to the G2 proof; D008 remains OPEN)
+
+Translated numeric FP is implemented in software on integer bit patterns
+(`src/aot/aot_fp.c`, `src/aot/aot_fp.h`), never via host floating-point
+arithmetic, so no host MXCSR state, x87/SSE NaN propagation, denormal mode or
+host flag behavior is assumed. The supported finite subset is F32/F64
+FADD/FSUB/FMUL/FDIV/FCMP/FCMPE with FPCR modes RN/RP/RM/RZ and the DN and FZ
+bits, plus sticky FPSR flag accumulation (IOC/DZC/OFC/UFC/IXC/IDC, with QC
+preserved). DN affects NaN result selection/quieting and FZ flushes denormal
+inputs/results with IDC/UFC as specified; signed zeros, NaN precedence and
+rounding ties are covered by closed-form rows with raw integer expectations.
+
+The numeric FPCR guard is checked BEFORE the operation and any destination or
+FPSR write. An unsupported numeric mode faults with fault CODE
+`AOT_FAULT_BAD_STATE` and fault STATUS `AOT_FP_ERR_UNSUPPORTED_FPCR` (`1`),
+`fault_src` = operation PC, and leaves the whole guest state unchanged except
+the runtime-owned PC. Bitwise FMOV/FABS/FNEG use the low-32 ABI unmasked by
+that numeric guard (they are pure bit operations and must not quiet or
+reinterpret NaNs).
+
+Reason: the G2 gate must be deterministic and testable without depending on
+host FP behavior, and the pinned Unicorn A57 oracle cannot judge unsupported
+FPCR bits (it masks them), so those rows are native-only evidence.
+
+Consequences: this supersedes ONLY the "numeric FP/FPCR/FPSR semantics ... are
+PLAN" consequence of D010, and any implication in D011 that FP architecture is
+still unaddressed. It does not change the D010 ABI/HLE design (`AotGuestState`
+stays 816 bytes; `AOT_ABI_VERSION`, `AOT_STATE_LAYOUT` and the layout are
+unchanged) and does not choose a global backend (D008 remains OPEN). The
+expanded subset is identified as `AOT_SUBSET_ID "g2-core-v2"`.
+Guarded by the native-only translated probe (unsupported-mode faults, bitwise
+low-32 ABI, closed-form translated rows), the differential matrix and the
+`fpdropflags` / `fproundrn` / `fpnanorder` / `fpignoreguard` negative controls.
+
+## D013 — Scoped translated-memory/exclusive-monitor model for the G2 proof
+
+**Status:** Accepted (scoped to the G2 proof; D008 remains OPEN)
+
+Shared mutable guest memory in the proof is defined ONLY through the arena API
+(`src/aot/aot_mem.c`, `src/aot/aot_mem.h`), where every access (ordinary, HLE,
+ordered and exclusive) is serialized under one domain-wide lock: the proof's
+memory model is sequentially consistent. SC is deliberately stronger than the
+guest's weak model, so it can never be silently weaker. Each runtime holds an
+explicit, stable exclusive-monitor token registered in the domain, while the
+reservation itself (address + size, 0 = disarmed) lives in the shared domain,
+never in guest state or `AotGuestState`.
+
+Invalidation uses a 64-byte proof granule (cited A57 ERG4) and is deliberately
+conservative: any store, including a same-value (ABA) write or a neighbour in
+the granule, disarms an overlapping reservation; STXR still requires an exact
+address + width match. The SVC/HOSTCALL boundary clears the LOCAL reservation
+before and after the handler as a conservative proof policy (not an
+unconditional ARM exception-entry guarantee); a RET sentinel preserves the
+reservation, while a fault or HLE boundary clears the local one. HLE handlers
+must perform all guest-memory access through the API using the provided
+`user` pointer (typically the AotMem/arena).
+
+Ownership/lifetime preconditions are part of the contract: `aot_mem_init`
+registrations are frozen before concurrent use; one host byte belongs to at
+most one live domain; alias domains are not detectable and are out of scope;
+an arena outlives every AotMem copy and the domain; release detaches every
+borrowed pointer and never frees caller-owned state/image; a live runtime is
+single-owner and non-copyable, with no concurrent run/release.
+
+Reason: a proof of correctness first. A faster weak/TSO-style backend or
+barrier elision cannot be justified by this evidence, so no barrier-dropping
+mutant claim is made; the wrong-backend controls are C-race-free (they exercise
+the invalidation predicate in a deterministic 2-runtime schedule rather than
+live-thread mutants).
+
+Consequences: this supersedes ONLY the "atomics/ordering remain PLAN"
+consequence of D010. It does not change the D010 ABI/HLE design or the ABI
+identity, and does not choose a global backend (D008 remains OPEN). It is
+guarded by the translated-memory concurrency schedule tests, their
+`AOT_MEM_TEST_NO_INVALIDATION` wrong-backend control, and the independent
+Capstone CFG checker for exact per-chunk ranges.

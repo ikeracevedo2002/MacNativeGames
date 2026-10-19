@@ -27,10 +27,17 @@
 #include <stdint.h>
 
 /* Identity triple. Any of these changing is an ABI/subset change and must be
- * reflected in the CFG manifest identity and in the generated code. */
+ * reflected in the CFG manifest identity and in the generated code.
+ *
+ * Subset id g2-core-v2: the same ABI (AOT_ABI_VERSION / AOT_STATE_LAYOUT and
+ * the 816-byte AotGuestState layout are UNCHANGED) over an expanded finite
+ * instruction subset: the FP differential matrix (F32/F64 add/sub/mul/div/
+ * fcmp/fcmpe, RN/RP/RM/RZ x DN x FZ), the post-SVC/post-HOSTCALL numeric
+ * fixtures and the translated-memory concurrency fixtures. v1 was the smaller
+ * first-subset id; see DECISIONS.md D012 for the scoped supersession. */
 #define AOT_ABI_VERSION        1u
 #define AOT_STATE_LAYOUT       1u
-#define AOT_SUBSET_ID          "g2-core-v1"
+#define AOT_SUBSET_ID          "g2-core-v2"
 
 #define AOT_GPR_COUNT          31u   /* x0..x30 */
 #define AOT_VREG_COUNT         32u
@@ -137,6 +144,12 @@ typedef struct AotHleRequest {
  *     nzcv, v[], fpcr, fpsr, tpidr, tpidrro), including x30, sp and flags;
  *   - the handler must NOT be relied on to redirect control: the runtime owns
  *     pc and computes resume_pc itself, ignoring any handler change to pc;
+ *   - ALL guest-memory access in a handler MUST go through the shared aot_mem_*
+ *     API (the `user` pointer may carry the AotMem/arena). The runtime clears
+ *     the LOCAL exclusive monitor at the SVC/HOSTCALL boundary, including
+ *     after the handler; that clear is a CONSERVATIVE G2 PROOF POLICY, not an
+ *     unconditional ARM exception-entry guarantee, and it is NOT a licence to
+ *     read/write arena bytes directly;
  *   - nonlocal PC exits and callback reentry into guest code from a handler
  *     are NOT supported in G2. A handler that wants to observe/report does so
  *     through its own out-of-band state; it does not re-enter the dispatcher;

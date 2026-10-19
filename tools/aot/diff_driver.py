@@ -14,6 +14,7 @@ timeouts and nonzero process exits are failures, never silent skips.
 import argparse
 import json
 import os
+import re
 import random
 import struct
 import subprocess
@@ -147,12 +148,13 @@ def make_cases():
 
     def add(name, pc, x=None, nzcv=0, handlers=((HLE_SVC, 0x40), (HLE_HOSTCALL, 0)),
             expected_fault=False, fault_addr=0, fault_src=0, fault_size=0,
-            v=None, guest_base=None):
+            v=None, guest_base=None, fpcr=None, fpsr=None):
         cases.append({"name": name, "pc": pc, "x": x or {}, "nzcv": nzcv,
                       "handlers": handlers, "expected_fault": expected_fault,
                       "fault_addr": fault_addr, "fault_src": fault_src,
                       "fault_size": fault_size, "v": v or {},
-                      "guest_base": GUEST_BASE if guest_base is None else guest_base})
+                      "guest_base": GUEST_BASE if guest_base is None else guest_base,
+                      "fpcr": fpcr, "fpsr": fpsr})
 
     # integer / flags
     add("adds_imm", 0x1000, {"x0": 0xFFFFFFFFFFFFFFFF}, 0)
@@ -254,6 +256,150 @@ def make_cases():
     add("veor_rd_eq_rn_dirty", 0x18D0, {}, 0, v=dirtyv)
     add("vorr_rd_eq_rm_dirty", 0x18F0, {}, 0, v=dirtyv)
 
+    # ---- stage-5: scalar FP arithmetic/compare (oracle: Unicorn A57) ----
+    D1_5 = 0x3FF8000000000000
+    D2_25 = 0x4002000000000000
+    D1_0 = 0x3FF0000000000000
+    D3_0 = 0x4008000000000000
+    DQNAN = 0x7FF8000000000001
+    DSNAN = 0x7FF0000000000001
+    F1_5 = 0x3FC00000
+    F2_25 = 0x40100000
+    F1_0 = 0x3F800000
+    F3_0 = 0x40400000
+    FQNAN = 0x7FC00001
+    FSNAN = 0x7F800001
+
+    def v2(lo, hi=0xDEADBEEFDEADBEEF):
+        return (hi << 64) | lo
+
+    add("fadd_d", 0x1900, {}, 0, v={1: v2(D1_5), 2: v2(D2_25)})
+    add("fsub_d", 0x1920, {}, 0, v={1: v2(D1_5), 2: v2(D2_25)})
+    add("fmul_d", 0x1940, {}, 0, v={1: v2(D1_5), 2: v2(D2_25)})
+    add("fdiv_d", 0x1960, {}, 0, v={1: v2(D1_0), 2: v2(D3_0)}, fpcr=0x00000000)
+    add("fdiv_d_rz", 0x1960, {}, 0, v={1: v2(D1_0), 2: v2(D3_0)},
+        fpcr=0x00C00000)
+    add("fadd_d_rn_tiny", 0x1900, {}, 0,
+        v={1: v2(D1_0), 2: v2(0x3C30000000000000)}, fpcr=0x00000000)
+    add("fadd_d_qnan", 0x1900, {}, 0, v={1: v2(DQNAN), 2: v2(D1_0)})
+    add("fadd_d_snan", 0x1900, {}, 0, v={1: v2(DSNAN), 2: v2(D1_0)})
+    add("fadd_d_fz_subnormal", 0x1900, {}, 0,
+        v={1: v2(0x0000000000000001), 2: v2(0x0010000000000000)},
+        fpcr=0x01000000)
+    add("fadd_s", 0x1980, {}, 0, v={1: v2(F1_5), 2: v2(F2_25)})
+    add("fsub_s", 0x19A0, {}, 0, v={1: v2(F1_5), 2: v2(F2_25)})
+    add("fmul_s", 0x19C0, {}, 0, v={1: v2(F1_5), 2: v2(F2_25)})
+    add("fdiv_s", 0x19E0, {}, 0, v={1: v2(F1_0), 2: v2(F3_0)},
+        fpcr=0x00000000)
+    add("fdiv_s_rm", 0x19E0, {}, 0, v={1: v2(F1_0), 2: v2(F3_0)},
+        fpcr=0x00800000)
+    add("fadd_s_qnan", 0x1980, {}, 0, v={1: v2(FQNAN), 2: v2(F1_0)})
+    add("fcmp_d_lt", 0x1A00, {}, 0, v={1: v2(D1_0), 2: v2(D3_0)})
+    add("fcmp_d_nan", 0x1A00, {}, 0, v={1: v2(DQNAN), 2: v2(D1_0)}, fpsr=0)
+    add("fcmpe_d_qnan", 0x1A20, {}, 0, v={1: v2(DQNAN), 2: v2(D1_0)}, fpsr=0)
+    add("fcmpe_d_snan", 0x1A20, {}, 0, v={1: v2(DSNAN), 2: v2(D1_0)}, fpsr=0)
+    add("fcmp_s_gt", 0x1A40, {}, 0, v={1: v2(F3_0), 2: v2(F1_0)})
+    add("fcmpe_s_qnan", 0x1A60, {}, 0, v={1: v2(FQNAN), 2: v2(F1_0)}, fpsr=0)
+    add("fcmp_zero_d_gt", 0x1A80, {}, 0, v={1: v2(D1_0)})
+    add("fcmpe_zero_s_nan", 0x1AA0, {}, 0, v={1: v2(FQNAN)}, fpsr=0)
+
+    # ---- stage-5: exclusive / ordered scalar + barriers ----
+    A0 = GUEST_BASE + 0x40
+    add("ldxr_x", 0x1B00, {"x1": A0}, 0)
+    add("ldxr_w", 0x1B10, {"x1": A0}, 0)
+    add("ldxrb", 0x1B20, {"x1": A0}, 0)
+    add("ldxrh", 0x1B30, {"x1": A0}, 0)
+    add("stxr_x", 0x1B40, {"x1": A0, "x0": 0x1122334455667788,
+                           "x3": 0xDEAD}, 0)
+    add("stxr_w", 0x1B50, {"x1": A0, "x0": 0xFFFFFFFF99887766, "x3": 0xDEAD}, 0)
+    add("stxrb", 0x1B60, {"x1": A0, "x0": 0xFFFFFFFFFFFFFFAA, "x3": 0xDEAD}, 0)
+    add("stxrh", 0x1B70, {"x1": A0, "x0": 0xFFFFFFFFFFFFBBAA, "x3": 0xDEAD}, 0)
+    add("ldar_x", 0x1B80, {"x1": A0}, 0)
+    add("ldar_w", 0x1B90, {"x1": A0}, 0)
+    add("ldarb", 0x1BA0, {"x1": A0}, 0)
+    add("ldarh", 0x1BB0, {"x1": A0}, 0)
+    add("stlr_x", 0x1BC0, {"x1": A0, "x0": 0x1122334455667788}, 0)
+    add("stlr_w", 0x1BD0, {"x1": A0, "x0": 0xFFFFFFFF99887766}, 0)
+    add("stlrb", 0x1BE0, {"x1": A0, "x0": 0xFFFFFFFFFFFFFFAA}, 0)
+    add("stlrh", 0x1BF0, {"x1": A0, "x0": 0xFFFFFFFFFFFFBBAA}, 0)
+    add("ldxr_stxr_ok", 0x1C00, {"x1": A0, "x3": 0xDEAD}, 0)
+    add("ldxr_stxr_other", 0x1C20, {"x1": A0, "x3": 0xDEAD}, 0)
+    add("ldxr_str_stxr", 0x1C40, {"x1": A0, "x2": 0xAABBCCDDEEFF0011,
+                                  "x3": 0xDEAD}, 0)
+    add("ldxr_stlr_stxr", 0x1C60, {"x1": A0, "x2": 0xAABBCCDDEEFF0011,
+                                   "x3": 0xDEAD}, 0)
+    add("clrex", 0x1C80, {}, 0)
+    add("barriers_noop_under_sc", 0x1CA0, {}, 0)
+
+    # ---- stage-FP-matrix: generated differential coverage -----------------
+    # 2 widths x 6 ops x 16 FPCR modes x 12 operand pairs = 2304 cases.
+    # Sticky FPSR seeds rotate 0 / QC / all-sticky. Expected values come ONLY
+    # from the pinned Unicorn A57 oracle; no expected vector is hardcoded here.
+    fp_ops = [("add", 0x1900, 0x1980), ("sub", 0x1920, 0x19A0),
+              ("mul", 0x1940, 0x19C0), ("div", 0x1960, 0x19E0),
+              ("cmp", 0x1A00, 0x1A40), ("cmpe", 0x1A20, 0x1A60)]
+    fp_seeds = [0, 0x08000000, 0x9F]      # 0 / QC / sticky IOC..IDC
+    pairs32 = [(0x00000000, 0x00000000), (0x80000000, 0x00000000),
+               (0x3F800000, 0x40400000), (0x7F800000, 0xFF800000),
+               (0x7FC00002, 0x3F800000), (0x7F800001, 0x3F800000),
+               (0x7FC00002, 0x7F800001), (0x00000001, 0x00000002),
+               (0x00800000, 0x3F000000), (0x7F7FFFFF, 0x40000000),
+               (0x00800001, 0x3F000000), (0x7F7FFFFF, 0x7FC00003)]
+    pairs64 = [(0x0000000000000000, 0x0000000000000000),
+               (0x8000000000000000, 0x0000000000000000),
+               (0x3FF0000000000000, 0x4008000000000000),
+               (0x7FF0000000000000, 0xFFF0000000000000),
+               (0x7FF8000000000002, 0x3FF0000000000000),
+               (0x7FF0000000000001, 0x3FF0000000000000),
+               (0x7FF8000000000002, 0x7FF0000000000001),
+               (0x0000000000000001, 0x0000000000000002),
+               (0x0010000000000000, 0x3FE0000000000000),
+               (0x7FEFFFFFFFFFFFFF, 0x4000000000000000),
+               (0x0010000000000001, 0x3FE0000000000000),
+               (0x7FEFFFFFFFFFFFFF, 0x7FF8000000000003)]
+    idx = 0
+    for wname, pairs in (("s", pairs32), ("d", pairs64)):
+        for oname, pc_d, pc_s in fp_ops:   # tuples are (op, D, S)
+            pc = pc_s if wname == "s" else pc_d
+            for rmode in range(4):
+                for fz in (0, 1):
+                    for dn in (0, 1):
+                        fpcr = (rmode << 22) | (fz << 24) | (dn << 25)
+                        for pa, pb in pairs:
+                            add("mat_%s_%s_r%d_fz%d_dn%d_%x_%x"
+                                % (wname, oname, rmode, fz, dn, pa, pb),
+                                pc, {}, 0, v={1: v2(pa), 2: v2(pb)},
+                                fpcr=fpcr, fpsr=fp_seeds[idx % 3])
+                            idx += 1
+
+    # Named, stable-address cases for future rounding/NaN mutants.
+    add("fadd_s_qnan_op1_preferred", 0x1980, {}, 0,
+        v={1: v2(0x7FC00002), 2: v2(0x7FC00003)}, fpsr=0)
+    add("fadd_d_qnan_op1_preferred", 0x1900, {}, 0,
+        v={1: v2(0x7FF8000000000002), 2: v2(0x7FF8000000000003)}, fpsr=0)
+    for rmode, nm in ((0x00000000, "rn"), (0x00400000, "rp"),
+                      (0x00800000, "rm"), (0x00C00000, "rz")):
+        add("fdiv_s_one_third_%s" % nm, 0x19E0, {}, 0,
+            v={1: v2(F1_0), 2: v2(F3_0)}, fpcr=rmode, fpsr=0)
+        add("fdiv_d_one_third_%s" % nm, 0x1960, {}, 0,
+            v={1: v2(D1_0), 2: v2(D3_0)}, fpcr=rmode, fpsr=0)
+
+    # ---- post-HLE numeric rounding: the HLE callback XORs FPCR 0xC00000, so a
+    # guest RP (0x400000) becomes RM (0x800000) BEFORE the translated FDIV
+    # executes. 1/3 must then be 0x3eaaaaaa, not the pre-call RP 0x3eaaaaab.
+    add("post_svc_fdiv_s", 0x1CC0, {}, 0,
+        v={1: v2(F1_0), 2: v2(F3_0)}, fpcr=0x00400000, fpsr=0)
+    add("post_svc_fdiv_s_sticky", 0x1CC0, {}, 0,
+        v={1: v2(F1_0), 2: v2(F3_0)}, fpcr=0x00400000, fpsr=0x9F)
+    add("post_svc_fdiv_d", 0x1D00, {}, 0,
+        v={1: v2(D1_0), 2: v2(D3_0)}, fpcr=0x00400000, fpsr=0)
+    add("post_hostcall_fdiv_s", 0x1CE0, {"x9": 0x3000}, 0,
+        v={1: v2(F1_0), 2: v2(F3_0)}, fpcr=0x00400000, fpsr=0)
+    add("post_hostcall_fdiv_s_sticky", 0x1CE0, {"x9": 0x3000}, 0,
+        v={1: v2(F1_0), 2: v2(F3_0)}, fpcr=0x00400000, fpsr=0x9F)
+    add("post_hostcall_fdiv_d", 0x1D20, {"x9": 0x3000}, 0,
+        v={1: v2(D1_0), 2: v2(D3_0)}, fpcr=0x00400000, fpsr=0)
+
     # ---- deterministic edge values + seeded random GPR cases ----
     rng = random.Random(0x5EED)
     m64 = (1 << 64) - 1
@@ -284,6 +430,10 @@ def native_run(exe, case, in_path, out_path):
         st["x"][int(k[1:])] = v
     for i, val in case.get("v", {}).items():
         st["v"][i] = val
+    if case.get("fpcr") is not None:
+        st["fpcr"] = case["fpcr"]
+    if case.get("fpsr") is not None:
+        st["fpsr"] = case["fpsr"]
     with open(in_path, "wb") as f:
         f.write(struct.pack("<II", IN_MAGIC, 1))
         f.write(struct.pack("<QQQQQ", case["pc"], STOP_PC, BUDGET,
@@ -365,6 +515,10 @@ def oracle_run(case, bin_bytes, block_starts, thunk_base, thunk_count, thunk_str
         st["x"][int(k[1:])] = v
     for i, val in case.get("v", {}).items():
         st["v"][i] = val
+    if case.get("fpcr") is not None:
+        st["fpcr"] = case["fpcr"]
+    if case.get("fpsr") is not None:
+        st["fpsr"] = case["fpsr"]
     for i in range(31):
         uc.reg_write(XREGS[i], st["x"][i])
     uc.reg_write(UC_ARM64_REG_SP, st["sp"])
@@ -524,6 +678,102 @@ def cmp_case(case, nat, orc):
     return errs, "mismatch"
 
 
+
+# ---- structural guards (independent of native/oracle agreement) -----------
+_FP_MAT_RE = re.compile(r"^mat_([sd])_(add|sub|mul|div|cmp|cmpe)_")
+_FP_MN = {"add": "fadd", "sub": "fsub", "mul": "fmul", "div": "fdiv",
+          "cmp": "fcmp", "cmpe": "fcmpe"}
+
+
+def check_fp_widths(bin_bytes, cases):
+    """Verify the CASE->INSTRUCTION width mapping by decoding raw words.
+
+    Both native and oracle agreeing proves nothing if the matrix points an
+    "s" case at a D instruction (or the reverse): both then execute the same
+    wrong width. This check decodes the actual fixture word with Capstone and
+    requires the register class to match the case name.
+    """
+    import capstone
+    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+    md.detail = True
+    errs = []
+    seen = {}
+    covered = set()
+    for c in cases:
+        m = _FP_MAT_RE.match(c["name"])
+        if not m:
+            continue
+        w, op = m.group(1), m.group(2)
+        # Deduplicate by (width, op, PC): a later matrix case for the same
+        # (width, op) but a DIFFERENT PC must still be decoded. Deduplicating
+        # by (width, op) alone silently ignored such a case, so a mis-pointed
+        # duplicate was invisible (lead-found false positive).
+        key = (w, op, c["pc"])
+        covered.add((w, op))
+        if key in seen:
+            continue
+        seen[key] = c["pc"]
+        ins = next(md.disasm(bin_bytes[c["pc"]:c["pc"] + 4], c["pc"]), None)
+        if ins is None:
+            errs.append("%s: no instruction at 0x%x" % (c["name"], c["pc"]))
+            continue
+        if ins.mnemonic != _FP_MN[op]:
+            errs.append("%s: 0x%x decodes %s, expected %s"
+                        % (c["name"], c["pc"], ins.mnemonic, _FP_MN[op]))
+            continue
+        regs = [r for r in ins.op_str.replace(" ", "").split(",") if r]
+        if not regs or not all(r.startswith(w) for r in regs):
+            errs.append("%s: 0x%x decodes '%s' but width %s was requested"
+                        % (c["name"], c["pc"], ins.op_str, w))
+    if len(covered) != 12:
+        errs.append("fp matrix width check saw %d/12 (width,op) pairs" % len(covered))
+
+    for c in cases:
+        if not c["name"].startswith("post_"):
+            continue
+        w = "d" if c["name"].endswith("_fdiv_d") else "s"
+        off = 8 if c["name"].startswith("post_hostcall") else 4
+        pc = c["pc"] + off
+        ins = next(md.disasm(bin_bytes[pc:pc + 4], pc), None)
+        if ins is None or ins.mnemonic != "fdiv":
+            errs.append("%s: expected fdiv at 0x%x" % (c["name"], pc))
+            continue
+        regs = [r for r in ins.op_str.replace(" ", "").split(",") if r]
+        if not regs or not all(r.startswith(w) for r in regs):
+            errs.append("%s: 0x%x decodes '%s' but width %s was requested"
+                        % (c["name"], pc, ins.op_str, w))
+    return errs
+
+
+def check_post_hle_expected(case, nat):
+    """Independent expected FPCR/FPSR/result for the post-HLE rows.
+
+    The oracle applies its own HLE model, so blind native/oracle agreement did
+    NOT catch a case pointing at the wrong-width fixture. These expectations
+    are closed form: FPCR RP(0x400000) ^ HLE XOR 0xC00000 = RM(0x800000);
+    FPSR = (seed ^ 0x2) | IXC; 1/3 in RM is 0x3eaaaaaa (S) / 0x3fd5555555555555 (D).
+    """
+    if not case["name"].startswith("post_"):
+        return []
+    errs = []
+    if nat.get("exit") != 10:   # AOT_EXIT_STOP
+        return ["post-HLE: native exit=%r (expected STOP)" % (nat.get("exit"),)]
+    st = nat["state"]
+    is_d = case["name"].endswith("_fdiv_d")
+    want_v0 = 0x3FD5555555555555 if is_d else 0x3EAAAAAA
+    # Full 128-bit lane: the expectation is the zero-extended 32/64-bit value,
+    # so nonzero upper bits also fail here (independent of the comparator).
+    got = st["v"][0]
+    if got != want_v0:
+        errs.append("post-HLE: v0=0x%x expected 0x%x (full 128-bit lane)"
+                    % (got, want_v0))
+    if st["fpcr"] != 0x00800000:
+        errs.append("post-HLE: fpcr=0x%x expected RM 0x800000" % st["fpcr"])
+    want_fpsr = ((case.get("fpsr") or 0) ^ 0x2) | 0x10
+    if st["fpsr"] != want_fpsr:
+        errs.append("post-HLE: fpsr=0x%x expected 0x%x" % (st["fpsr"], want_fpsr))
+    return errs
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
@@ -566,6 +816,12 @@ def main():
     os.makedirs(args.work, exist_ok=True)
 
     cases = make_cases()
+    width_errs = check_fp_widths(bin_bytes, cases)
+    if width_errs:
+        print("FAIL: case/instruction width structure:")
+        for e in width_errs[:10]:
+            print("  " + e)
+        return 2
     if args.limit:
         cases = cases[:args.limit]
 
@@ -587,6 +843,11 @@ def main():
         except Exception as e:
             failures.append("%s: oracle infra: %r" % (case["name"], e))
             mismatch += 1
+            continue
+        exp_errs = check_post_hle_expected(case, nat)
+        if exp_errs:
+            mismatch += 1
+            failures.append("%s: %s" % (case["name"], "; ".join(exp_errs)))
             continue
         errs, kind = cmp_case(case, nat, orc)
         if errs:

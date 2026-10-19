@@ -16,12 +16,12 @@ Do not mark a row VALIDATED because it compiles. Add evidence that satisfies the
 | Thread/sync abstraction | VALIDATED (host primitives only) | `src/host_thread.{h,c}`: `_beginthreadex`/`_endthreadex` callback (host C, per-thread CRT state), bounded join with `CloseHandle` checked, poll-before-id self-join guard, close-without-wait that does not extend the caller-owned argument's lifetime. `src/host_sync.{h,c}`: SRWLOCK exclusive + CONDITION_VARIABLE, heap-backed typed handles (no array type punning). `tests/host_thread_probe.c`: real battery plus 2 behavioral fakes rejected only by the join behavior they break; real-only self-join, close-while-running (gated worker, later join refused, worker body still runs) and create→join→reuse-spent-handle phases; failure field snapshots. `tests/host_sync_probe.c`: lifecycle battery (real only) including destroy→reinit, mutex-exclusion battery (real + no-op-mutex fake), CV battery (real + 3 condition fakes, all using a GENUINE mutex so no wrong backend is UB); worker `ready` event precedes the exclusion window; bounded predicate loops tolerate spurious wakes; broadcast requires a NON-timeout wake; timeout lower-bounded by an independent `QueryPerformanceCounter`; infrastructure failures FATAL/`ExitProcess(1)`. Debug and Release 10/10 CTest, `/W4` no warnings. Limitations: `HOST_THREAD_ERR_WAIT`, `HOST_SYNC_ERR_PLATFORM` and allocation paths are implemented but not forced; the mutex state after a `host_cond_wait` platform failure is UNKNOWN (documented, not promised). Scope: HOST threads/locks only; no guest thread ABI, scheduler, guest handles/events or address arbiters. |
 | Host logging abstraction | VALIDATED (host core logger only) | `src/host_log.{h,c}`: explicit handle, whole record `[LEVEL] tid=0x<8 hex> <message>\n` formatted then `fwrite`+`fflush` under a per-handle SRWLOCK; level filtering; bounded formatting with an explicit `...<truncated>` marker; `host_log_close` returns its OWN final flush/close result and always consumes the handle; no timestamps/rotation/callbacks/singleton and no process-global buffering mutation. `tests/host_log_probe.c`: shape/filter/truncation, CR/LF/NUL normalisation (one call = exactly one line), 4 writers × 200 records verified as one complete non-interleaved stream, a corrupted-stream checker with 5 rejected synthetic negatives, and a real `HOST_LOG_ERR_IO` write forced through a `_pipe`/`_dup2` broken-stderr fixture (no public hook); temporary files are removed after each phase. Debug and Release 10/10 CTest, `/W4` no warnings. Limitations: `host_log_close`'s OWN flush/close IO failure is not forced (stderr is unbuffered, so its close flush is clean — documented); an owned file sink whose `fclose` fails is not exercised. |
 | Fault/exception handling | NOT STARTED | Guarded guest memory fault probe passes |
-| AOT decoder/CFG | IN PROGRESS (scoped G2 proof) | Offline exact-mask decode + explicit manifest CFG; independently re-derived by Capstone 5.0.7 and compared to translator `meta.blocks` before any case. Opt-in `MN_BUILD_AOT_PROOF=ON`. Full G2 not closed. |
-| AOT integer/flags | IN PROGRESS (scoped G2 proof) | Differential fixture suite (683 exact + 1 deliberate OOB fault) against a pinned Unicorn A57 oracle; 8 real-lowering mutants rejected. Covers X/W add/sub (imm incl. lsl#12, shifted ASR), movz/movk moves, all 16 conditions with NZCV, CBZ/CBNZ W vs X. Integer logical ops are NOT implemented. |
-| AOT branches/calls | IN PROGRESS (scoped G2 proof) | Direct/indirect call fixtures (bl/blr/br, x30 capture) plus negative controls pass; STOP only legal after RET. |
-| AOT FP/SIMD | IN PROGRESS (scoped bitwise only) | Scalar-double bitwise fmov/fabs/fneg and vector .16B and/orr/eor/add/sub (SWAR). **Numeric FP/rounding/NaN/exceptions NOT covered.** |
-| AOT atomics/order | NOT STARTED | Exclusive/atomic fixtures pass |
-| Guest/HLE x64 ABI | IN PROGRESS (scoped G2 proof) | `AotGuestState` (816 B, 8-byte aligned) round-trips through native block entries and a registered typed native HLE handler (`void`, state effects, fixed resume). Host->guest callbacks/reentry not supported. See D010. |
+| AOT decoder/CFG | VALIDATED (scoped G2 controlled proof) | Offline exact-mask decode + explicit manifest CFG. The **concurrency** fixture uses exact per-chunk ranges (no gap/padding bytes); the **differential** fixture declares one containing range with unreachable padding and the reachable starts come from the explicit entries (plus indirect targets). Both are independently re-derived by Capstone 5.0.7 and compared to translator `meta.blocks` before any case. `tests/aot/conc_cfg_test.py` and `tests/aot/decoder_cfg_test.py` add an independent CFG check plus **3 committed width-validator negative controls** (late D case on the S site, late duplicate S case on a D site, post-HLE D case pointed at the S FDIV), locking a found false positive. Opt-in `MN_BUILD_AOT_PROOF=ON`. Full ISA/title parity is NOT claimed; D008 stays OPEN. |
+| AOT integer/flags | VALIDATED (scoped G2 controlled proof) | Differential fixture suite (part of 3049 = 3048 exact + 1 deliberate OOB fault) against a pinned Unicorn A57 oracle, `mismatch=0` in Debug and Release; real-lowering mutants rejected (`infra=0`). Covers X/W add/sub (imm incl. lsl#12, shifted ASR), movz/movk moves, all 16 conditions with NZCV, CBZ/CBNZ W vs X. Scalar integer logical ops (`and`/`orr`/`eor`) are NOT implemented. |
+| AOT branches/calls | VALIDATED (scoped G2 controlled proof) | Direct/indirect call fixtures (bl/blr/br, x30 capture) plus negative controls pass; STOP only legal after RET. |
+| AOT FP/SIMD | VALIDATED (scoped G2 controlled proof) | Numeric FP: F32/F64 `fadd`/`fsub`/`fmul`/`fdiv`/`fcmp`/`fcmpe` over RN/RP/RM/RZ × DN × FZ with sticky FPSR — 2304 differential matrix cells inside the 3049 oracle cases, 45 closed-form helper rows, 10 translated closed-form rows, and **392 native-only unsupported-FPCR faults + 3 bitwise low-32 ABI rows** counted separately (the oracle masks unsupported FPCR bits). Unsupported numeric modes fault before any destination/FPSR write (`AOT_FAULT_BAD_STATE` / `AOT_FP_ERR_UNSUPPORTED_FPCR`). Bitwise `fmov`/`fabs`/`fneg` are unmasked by the numeric guard; vector `.16B` `and`/`orr`/`eor`/`add`/`sub` (SWAR). **No FP16/FMA/sqrt/FP-conversion/full SIMD.** |
+| AOT atomics/order | VALIDATED (scoped serialized-SC proof model) | `ldxr`/`stxr` B/H/W/X and `ldar`/`stlr` B/H/W/X differential; `ldaxr`/`stlxr` X pair end-to-end (decoder/lowering all widths, not all fixtures). One domain-wide lock serializes every access (SC, deliberately stronger than the guest's weak model); 64-byte proof granule invalidation incl. same-value/ABA, exact address+width STXR match, per-runtime monitor token, HLE-boundary conservative local clear. The oracle is **value-based** for exclusives, so same-value/ABA is pinned by independent architectural reasoning plus locked **C-race-free wrong-backend controls** (no live-thread mutants); that is a known value-based monitor limitation of the oracle model, not a claim about upstream bugs. Barrier dropping is not a valid mutant under SC. **No weak/TSO-style backend, no alias domains.** |
+| Guest/HLE x64 ABI | VALIDATED (scoped G2 controlled proof) | `AotGuestState` (816 B, 8-byte aligned, unchanged layout; subset id `g2-core-v2`) round-trips through native block entries and a registered typed native HLE handler (`void`, state effects, fixed resume). Release detaches every borrowed pointer without freeing caller-owned state/image; a live runtime is single-owner with no concurrent run/release. Host->guest callbacks/reentry not supported. See D010/D012. |
 | Translated module loader | NOT STARTED | main/sdk/subsdk0 translated images map/link |
 | Module init/callbacks | NOT STARTED | Constructors and host callbacks execute correctly |
 | Core Horizon services | NOT STARTED | Headless boot checkpoint on Windows |
@@ -53,11 +53,31 @@ candidate evidence:
 | Core platform wrappers exist for memory, timing, threading and logging | host VM (memory), host monotonic clock (timing), host thread + mutex/condition (threading), host core logger (logging), plus host TLS slots | HOST primitives only: no guest ABI, scheduler or guest objects. Fault handling is a separately scoped row and is not part of G1's wrapper list |
 
 All three G1 criteria are locally validated in this candidate; hosted CI
-has not been run from this branch. A **scoped G2 AOT proof now exists**
-(`docs/g2-aot-proof.md`, D010/D011): validated controlled subsets
-(decoder/CFG, integer/flags, branches/calls, HLE round-trip) pass, while
-broader G2 areas (numerical FP, atomics/ordering) remain IN PROGRESS. Full G2
-is not closed; the proof makes no runtime fault-policy claim.
+has not been run from this branch. G1 is unchanged by the G2 documentation
+phase.
+
+## G2 gate summary (GOAL.md G2 / Plan Phase 1, controlled fixtures)
+
+**Evaluation (lead, local): SATISFIED LOCALLY — G2 is recorded CLOSED /
+VALIDATED for the controlled proof.** This covers only the controlled fixture
+subsets, not full ISA, title/game or backend parity.
+
+| G2 criterion (controlled fixtures) | Evidence | Honest limitation |
+|---|---|---|
+| AOT ARM64 -> x86-64 execution path with defined guest ABI | `AotGuestState` (816 B, 8-byte aligned) + typed native block exits + transcribed C blocks; see `docs/g2-aot-proof.md`, D010 | Controlled subset only; no full ISA; D008 backend choice OPEN |
+| Independent decode/CFG agreement | Exact-mask decoder + manifest CFG (concurrency: exact per-chunk ranges; differential: one containing range with unreachable padding, reached from explicit entries) vs independent Capstone 5.0.7 CFG; 3 width-validator negatives | Capstone/Unicorn are dev-only tools; no hosted CI |
+| Differential semantics evidence | 3049 cases = 3048 exact + 1 deliberate fault, `mismatch=0` (Debug 58.99 s and Release 58.69 s, external spaces-in-path builds) | Pinned Unicorn A57 oracle; value-based exclusives; masks unsupported FPCR bits |
+| Negative controls | 12 standard rejections, `infra=0` (11 real-lowering generator mutants + the `hlex18` native HLE-callback control, which is not a generator mutant; `pair32trunc` also asserts exact fault fields); separate native `fpignoreguard` guard control (typed STOP + changed FPCR/dest) | Guard cross-checks are manual exact-exit evidence, not CTest (`WILL_FAIL` refused) |
+| Numeric FP and memory/exclusive model within the controlled scope | 2304 FP matrix cells + 45 helper + 10 translated closed rows; 392 native-only unsupported-FPCR + 3 bitwise; serialized-SC arena with 2/4 real-thread and wrong-program-order controls | No FP16/FMA/sqrt/conversion/full SIMD; no weak/TSO backend; no alias/guest VM |
+| Stability (not a new exit condition) | 7 runtime/FP/concurrency tests × 100 repeats × Debug+Release = 1400 runs, all PASS (16.40 s / 16.08 s); AOT-OFF 10/10 both configs | Stability only; no hosted CI |
+
+Unchanged limitations: no FP16/FMA/sqrt/conversion/full SIMD/full ISA, no
+alias/guest VM/weak-TSO backend, no host->guest callback/reentry, no hardware
+or native-Mac oracle and no hosted CI. **D008 (global backend) and D007
+(graphics backend) remain OPEN; G3 (module loader/linking; the runtime
+fault/exception policy is a separate NOT STARTED prerequisite) has NOT
+STARTED, and real game boot is later still (G4/G6, none begun).** The candidate is uncommitted (main checkout on branch `windows-x86-port`,
+clean at `0a30a282`) and requires **explicit user approval** before integration.
 
 Repetition evidence (out-of-tree logs, not committed): `ctest -R
 "host_(thread_lifecycle|sync_mutex_cond|vm_region|log)_probe" --repeat
@@ -67,27 +87,27 @@ only; it does not close any additional exit condition.
 
 ## Current blockers
 
-1. **G2 is partially proven but not closed.** A scoped ARM64 -> x86-64
-   offline C-translation proof exists and passes (684 differential cases,
-   8 rejected mutants, Debug/Release; see `docs/g2-aot-proof.md`): validated
-   controlled subsets (decoder/CFG, integer/flags, branches/calls, HLE
-   round-trip) pass. Remaining G2 work is numerical FP (FPCR/FPSR
-   rounding/NaN/exceptions) and atomics/exclusives/ordering (both PLAN); the
-   full-module backend choice (D008) is still OPEN.
+1. **No G2 blocker remains for the controlled proof.** G2 is locally validated
+   for the controlled fixtures (`docs/g2-aot-proof.md`); the full-module
+   backend choice (D008) is still OPEN and is not a G2 controlled-fixture exit
+   condition.
 2. Fault/exception handling remains a separate NOT STARTED row; the VM
-   probe's local SEH guarded-access fixture is NOT runtime fault policy.
+   probe's local SEH guarded-access fixture is NOT runtime fault policy. A
+   runtime fault policy is a prerequisite for G3 loader/linking work, not a G2
+   controlled-fixture condition.
 3. Windows graphics backend is not selected or implemented (D007 open).
+4. Integration is blocked on **explicit user approval**; nothing is committed
+   or pushed.
 
 ## Next recommended work
 
-1. The next real gate is **G2**. A scoped offline C-translation proof and a
-guest-register-state ABI (D010) now exist (`MN_BUILD_AOT_PROOF=ON`); validated
-controlled subsets pass. Remaining G2 work: numerical FP/FPCR/FPSR semantics
-and atomics/ordering. The full-module translation backend (D008) remains OPEN.
-2. File/COW/alias mapping, fixed guest VA layout and the translated image
-   loader stay **G3**; the VM row above is only the anonymous private
-   reserve+commit primitive.
-3. Fault/exception handling (VEH/SEH abstraction) stays a separate row and
-   is a prerequisite for the loader's fault/guard mechanism.
-4. The graphics-backend spike (D007) remains open and follows G2/G3.
-5. Keep the Apple/ARM64 dependency inventory current as G1 proceeds.
+1. User reviews and approves (or rejects) integrating the validated G2
+   candidate. This is a user decision, not an automatic next step; do not start
+   G3 before that.
+2. After approval, G3 begins with the translated-image **loader/linking**,
+   file/COW/alias mapping and fixed guest VA layout, with the runtime
+   **fault/exception policy** (VEH/SEH abstraction) as its separate
+   prerequisite. Real game boot is later (G4/G6) and is not part of G3.
+3. The full-module translated-code backend (D008) and the graphics-backend
+   spike (D007) remain OPEN.
+4. Keep the Apple/ARM64 dependency inventory current as work proceeds.

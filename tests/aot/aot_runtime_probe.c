@@ -11,6 +11,7 @@
 #include "aot_runtime.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_fail = 0;
@@ -19,6 +20,7 @@ static int g_fail = 0;
 } while (0)
 
 static AotGuestState g_state;
+static AotMemDomain *g_dom;
 static int g_probe_hle_calls = 0;
 
 /* ---- fake blocks (test fixtures only) ---- */
@@ -51,6 +53,10 @@ static AotExit blk_br_thunk(AotGuestState *s, AotRuntime *rt) {
 }
 static AotExit blk_ret_thunk(AotGuestState *s, AotRuntime *rt) {
     (void)s; rt->site_pc = 0x1000; rt->next_pc = 0x2000; return AOT_EXIT_RET;
+}
+static AotExit blk_call_thunk(AotGuestState *s, AotRuntime *rt) {
+    (void)s; rt->site_pc = 0x1000; rt->next_pc = 0x2000;
+    return AOT_EXIT_CALL_INDIRECT;
 }
 static void hle_count(AotGuestState *s, const AotHleRequest *req, void *u) {
     (void)s; (void)req; (void)u; g_probe_hle_calls++;
@@ -135,9 +141,12 @@ static void test_image_validate(void) {
 static void test_init_lookup(void) {
     AotMem mem;
     uint8_t arena[64];
-    CHECK(aot_mem_init(&mem, arena, sizeof(arena), 0x100000ull) == AOT_MEM_OK, "mem init");
+    AotMemDomain *dom = aot_mem_domain_create();
+    CHECK(dom != NULL, "domain create");
+    CHECK(aot_mem_init(&mem, dom, arena, sizeof(arena), 0x100000ull) == AOT_MEM_OK, "mem init");
 
     AotRuntime rt;
+    memset(&rt, 0, sizeof(rt));
     CHECK(aot_rt_init(&rt, &img_base, mem, NULL, 10) == AOT_FAULT_BAD_STATE,
           "init null state rejected");
     CHECK(aot_rt_init(&rt, NULL, mem, &g_state, 10) == AOT_FAULT_NONE,
@@ -150,20 +159,28 @@ static void test_init_lookup(void) {
     CHECK(aot_rt_lookup(&rt, 0x1002ull) == NULL, "lookup misaligned");
     CHECK(aot_rt_lookup(&rt, 0x1008ull) == NULL, "lookup mid-range unknown");
     CHECK(aot_rt_lookup(&rt, 0x2000ull) == NULL, "lookup out of range");
+    aot_rt_release(&rt);
+    aot_mem_domain_destroy(dom);
 }
 
 /* ---- run / stop sentinel ---- */
 static void run_img(AotRuntime *rt, const AotImage *im, uint64_t entry,
                     uint64_t budget) {
-    AotMem mem; uint8_t arena[64];
+    /* The arena is registered in the long-lived g_dom, so its lifetime MUST
+     * outlive the domain: a stack-local arena here would dangle as soon as
+     * run_img returns. The registration status is checked, not discarded. */
+    static uint8_t arena[64];
+    AotMem mem;
     (void)entry;   /* entry is supplied to aot_rt_run by the caller */
     memset(&g_state, 0, sizeof(g_state));
-    aot_mem_init(&mem, arena, sizeof(arena), 0x100000ull);
+    CHECK(aot_mem_init(&mem, g_dom, arena, sizeof(arena), 0x100000ull) == AOT_MEM_OK,
+          "run_img arena registration");
     aot_rt_init(rt, im, mem, &g_state, budget);
 }
 
 static void test_run_stop(void) {
     AotRuntime rt;
+    memset(&rt, 0, sizeof(rt));
     AotImage im;
 
     im = img_base; im.blocks = blocks1;
@@ -240,6 +257,7 @@ static void hle_badstate(AotGuestState *s, const AotHleRequest *req, void *u) {
 
 static void test_hle(void) {
     AotRuntime rt;
+    memset(&rt, 0, sizeof(rt));
     AotImage im = img_base;
     AotBlockEntry svc = { 0x1000ull, blk_svc };
 
@@ -281,10 +299,17 @@ static void test_hle(void) {
 /* ---- arena + state invariants ---- */
 static void test_arena_state(void) {
     AotMem m; uint8_t a[32];
-    CHECK(aot_mem_init(&m, a, 0, 0x100000ull) == AOT_MEM_ERR_RANGE, "zero-size arena");
-    CHECK(aot_mem_init(&m, a, sizeof(a), UINT64_MAX - 8ull) == AOT_MEM_ERR_RANGE,
+    AotMemDomain *dom = aot_mem_domain_create();
+    CHECK(dom != NULL, "arena domain create");
+    CHECK(aot_mem_init(&m, dom, a, 0, 0x100000ull) == AOT_MEM_ERR_RANGE, "zero-size arena");
+    CHECK(aot_mem_init(&m, dom, a, sizeof(a), UINT64_MAX - 8ull) == AOT_MEM_ERR_RANGE,
           "guest_base+size wrap");
-    CHECK(aot_mem_init(&m, a, sizeof(a), 0x1000ull) == AOT_MEM_OK, "arena ok");
+    /* Host base + size wrap must fail closed before any registration or
+     * dereference; the synthetic pointer is only converted to an integer. */
+    uint8_t *synthetic = (uint8_t *)(uintptr_t)(UINTPTR_MAX - 8u);
+    CHECK(aot_mem_init(&m, dom, synthetic, 32, 0x1000ull) == AOT_MEM_ERR_RANGE,
+          "host base+size wrap");
+    CHECK(aot_mem_init(&m, dom, a, sizeof(a), 0x1000ull) == AOT_MEM_OK, "arena ok");
 
     uint64_t v = 0;
     CHECK(aot_mem_st64(&m, 0x1000ull, 0x1122334455667788ull) == AOT_MEM_OK, "st64");
@@ -297,6 +322,29 @@ static void test_arena_state(void) {
     CHECK(aot_mem_check(&m, 0x1020ull, 0) == AOT_MEM_OK, "end-of-arena zero length");
     CHECK(aot_mem_ld8(&m, 0x1020ull, (uint8_t *)&v) == AOT_MEM_ERR_RANGE, "load at end");
 
+    /* B3: the domain, not the copied AotMem value, owns the bounds. A forged
+     * enlarged size must not read/FNV past the registered arena. */
+    AotMem forged = m;
+    forged.size += 1u;
+    CHECK(aot_mem_check(&forged, 0x1000ull, 1) == AOT_MEM_ERR_RANGE,
+          "forged size rejected by check");
+    CHECK(aot_mem_ld8(&forged, 0x1000ull, (uint8_t *)&v) == AOT_MEM_ERR_RANGE,
+          "forged size rejected by load");
+    CHECK(aot_mem_fnv1a(&forged) == 0u, "forged size rejected by fnv1a");
+    forged = m; forged.base += 1u;
+    CHECK(aot_mem_st8(&forged, 0x1000ull, 0x5Au) == AOT_MEM_ERR_RANGE,
+          "forged base rejected by store");
+
+    /* Alias rejection: same host bytes, different guest_base in one domain
+     * must not create a second reservation namespace. */
+    AotMem alias;
+    CHECK(aot_mem_init(&alias, dom, a, sizeof(a), 0x2000ull) == AOT_MEM_ERR_RANGE,
+          "same host bytes / different guest base rejected");
+    CHECK(aot_mem_init(&alias, dom, a, sizeof(a), 0x1000ull) == AOT_MEM_OK,
+          "exact identity re-init accepted");
+
+    aot_mem_domain_destroy(dom);
+
     AotGuestState s; memset(&s, 0, sizeof(s));
     CHECK(aot_state_validate(&s) == AOT_STATE_OK, "state ok");
     s.nzcv = 1ull;
@@ -307,9 +355,98 @@ static void test_arena_state(void) {
     CHECK(aot_state_validate(&s) == AOT_STATE_ERR_FPSR, "fpsr >32");
 }
 
+/* ---- release / fault lifecycle safety ---- */
+static void test_release_and_fault_lifecycle(void) {
+    AotMemDomain *dom = aot_mem_domain_create();
+    CHECK(dom != NULL, "lifecycle domain create");
+    uint8_t arena[64];
+    AotMem mem;
+    CHECK(aot_mem_init(&mem, dom, arena, sizeof(arena), 0x100000ull) == AOT_MEM_OK,
+          "lifecycle arena");
+
+    AotRuntime rt;
+    memset(&rt, 0, sizeof(rt));
+    memset(&g_state, 0, sizeof(g_state));
+    CHECK(aot_rt_init(&rt, &img_base, mem, &g_state, 10) == AOT_FAULT_NONE,
+          "lifecycle init");
+    CHECK(rt.monitor_token != 0u, "lifecycle token attached");
+    CHECK(rt.image == &img_base && rt.mem.domain == dom, "lifecycle identity set");
+
+    /* A fault clears this runtime's LOCAL reservation (but not the STOP
+     * sentinel path, which is regression-tested in the concurrency probe). */
+    uint64_t v = 0;
+    uint32_t st = 0xEE;
+    CHECK(aot_mem_ldx(&mem, rt.monitor_token, 0x100000ull, 8, &v) == AOT_MEM_OK,
+          "arm before fault");
+    CHECK(aot_rt_run(&rt, 0x1000ull, 0x1000ull) == AOT_EXIT_FAULT,
+          "fault lifecycle run faults");
+    CHECK(aot_mem_stx(&mem, rt.monitor_token, 0x100000ull, 8, 0x11ull, &st) == AOT_MEM_OK,
+          "stx after fault");
+    CHECK(st == 1u, "runtime fault clears LOCAL reservation, not the token");
+
+    /* Release leaves the runtime NON-runnable and identity-free, so destroying
+     * the domain immediately after the last release cannot leave a dangling
+     * domain/image reachable from a later run. */
+    aot_rt_release(&rt);
+    CHECK(rt.mem.domain == NULL && rt.image == NULL && rt.monitor_token == 0u,
+          "release clears domain/token/image identity");
+    CHECK(rt.init_magic == 0u, "release clears init magic");
+    CHECK(rt.state == NULL, "release detaches borrowed guest state pointer");
+    aot_mem_domain_destroy(dom);
+
+    memset(&g_state, 0, sizeof(g_state));
+    CHECK(aot_rt_run(&rt, 0x1000ull, 0ull) == AOT_EXIT_FAULT,
+          "run after release+domain destroy faults instead of touching freed domain");
+    CHECK(rt.fault == AOT_FAULT_BAD_STATE,
+          "run after release reports BAD_STATE (state detached, checked before image)");
+
+    /* Release only DETACHES the borrowed state; the caller owns/frees it. Poison
+     * the backing state after release and prove an erroneous run leaves it
+     * untouched (no stale rt->state->pc write in fault_out). */
+    AotMemDomain *dom2 = aot_mem_domain_create();
+    CHECK(dom2 != NULL, "owned-state domain create");
+    uint8_t arena2[64];
+    AotMem mem2;
+    CHECK(aot_mem_init(&mem2, dom2, arena2, sizeof(arena2), 0x100000ull) == AOT_MEM_OK,
+          "owned-state arena");
+    AotGuestState *owned = (AotGuestState *)malloc(sizeof(AotGuestState));
+    CHECK(owned != NULL, "owned-state alloc");
+    memset(owned, 0, sizeof(*owned));
+    AotRuntime rt2;
+    memset(&rt2, 0, sizeof(rt2));
+    CHECK(aot_rt_init(&rt2, &img_base, mem2, owned, 10) == AOT_FAULT_NONE,
+          "owned-state init");
+    aot_rt_release(&rt2);
+    CHECK(rt2.state == NULL, "owned-state release detaches borrowed pointer");
+    memset(owned, 0xAA, sizeof(*owned));   /* caller poisons its own state */
+    CHECK(aot_rt_run(&rt2, 0x1000ull, 0ull) == AOT_EXIT_FAULT,
+          "run with poisoned released state faults");
+    CHECK(rt2.fault == AOT_FAULT_BAD_STATE, "poisoned run reports BAD_STATE");
+    CHECK(owned->pc == 0xAAAAAAAAAAAAAAAAull && owned->sp == 0xAAAAAAAAAAAAAAAAull,
+          "erroneous run did not write the caller's released state");
+    free(owned);
+    /* Backing state now genuinely freed: the run must still not touch it. */
+    CHECK(aot_rt_run(&rt2, 0x1000ull, 0ull) == AOT_EXIT_FAULT,
+          "run after backing-state free faults cleanly");
+    aot_mem_domain_destroy(dom2);
+
+    /* Re-init is the supported recovery path and must attach a fresh token. */
+    dom = aot_mem_domain_create();
+    CHECK(dom != NULL, "lifecycle re-init domain");
+    CHECK(aot_mem_init(&mem, dom, arena, sizeof(arena), 0x100000ull) == AOT_MEM_OK,
+          "lifecycle re-init arena");
+    CHECK(aot_rt_init(&rt, &img_base, mem, &g_state, 10) == AOT_FAULT_NONE,
+          "lifecycle re-init after release");
+    CHECK(rt.monitor_token != 0u && rt.image == &img_base, "re-init attaches identity");
+    CHECK(aot_rt_run(&rt, 0x1000ull, 0ull) == AOT_EXIT_STOP, "re-init runnable");
+    aot_rt_release(&rt);
+    aot_mem_domain_destroy(dom);
+}
+
 /* ---- thunk transfer contract ---- */
 static void test_thunk_transfer(void) {
     AotRuntime rt;
+    memset(&rt, 0, sizeof(rt));
     AotImage im = img_base;
     im.thunk_base = 0x2000ull; im.thunk_count = 1; im.thunk_stride = AOT_THUNK_STRIDE;
 
@@ -336,13 +473,129 @@ static void test_thunk_transfer(void) {
     CHECK(g_probe_hle_calls == 0, "RET->thunk handler not called");
 }
 
+/* ---- exclusive monitor: reservation granule + HLE boundary ---- */
+static void test_exclusive_monitor(void) {
+    AotMemDomain *dom = aot_mem_domain_create();
+    CHECK(dom != NULL, "monitor domain create");
+    uint8_t arena[512];
+    AotMem mem;
+    CHECK(aot_mem_init(&mem, dom, arena, sizeof(arena), 0x100000ull) == AOT_MEM_OK,
+          "monitor arena init");
+    uint32_t tok = aot_mem_domain_attach(dom);
+    CHECK(tok != 0u, "monitor attach");
+
+    uint64_t base = 0x100000ull + 0x100ull;   /* 64-byte aligned */
+    uint64_t v = 0;
+    uint32_t st = 0xEE;
+
+    /* Neighbouring store in the SAME 64-byte granule disarms the reservation,
+     * even though it does not overlap the loaded 8 bytes. */
+    CHECK(aot_mem_ldx(&mem, tok, base, 8, &v) == AOT_MEM_OK, "ldx granule same");
+    CHECK(aot_mem_st8(&mem, base + 8u, 0x5Au) == AOT_MEM_OK, "same-granule st8");
+    CHECK(aot_mem_stx(&mem, tok, base, 8, 0x1122334455667788ull, &st) == AOT_MEM_OK,
+          "stx after same-granule store");
+    CHECK(st == 1u, "same-granule store invalidates reservation");
+
+    /* A store in a DIFFERENT granule must preserve the reservation. */
+    st = 0xEE;
+    CHECK(aot_mem_ldx(&mem, tok, base, 8, &v) == AOT_MEM_OK, "ldx granule diff");
+    CHECK(aot_mem_st8(&mem, base + 64u, 0x5Bu) == AOT_MEM_OK, "different-granule st8");
+    CHECK(aot_mem_stx(&mem, tok, base, 8, 0x8877665544332211ull, &st) == AOT_MEM_OK,
+          "stx after different-granule store");
+    CHECK(st == 0u, "different-granule store preserves reservation");
+
+    /* A 16-byte store may straddle a granule boundary; it must invalidate a
+     * reservation in the granule it touches. */
+    uint64_t cross = 0x100000ull + 0x140ull;
+    uint64_t pair[2] = { 0x1111111111111111ull, 0x2222222222222222ull };
+    st = 0xEE;
+    CHECK(aot_mem_ldx(&mem, tok, cross, 8, &v) == AOT_MEM_OK, "ldx next granule");
+    CHECK(aot_mem_st128(&mem, cross - 8u, pair) == AOT_MEM_OK,
+          "straddling st128");
+    CHECK(aot_mem_stx(&mem, tok, cross, 8, 0x99ull, &st) == AOT_MEM_OK,
+          "stx after straddling store");
+    CHECK(st == 1u, "straddling store invalidates reservation granule");
+
+    /* CLREX / detach semantics stay local to this token. */
+    st = 0xEE;
+    CHECK(aot_mem_ldx(&mem, tok, base, 8, &v) == AOT_MEM_OK, "ldx before clrex");
+    aot_mem_clrex(&mem, tok);
+    CHECK(aot_mem_stx(&mem, tok, base, 8, 0xAAull, &st) == AOT_MEM_OK,
+          "stx after clrex");
+    CHECK(st == 1u, "CLREX clears local reservation");
+
+    aot_mem_domain_detach(dom, tok);
+    aot_mem_domain_destroy(dom);
+}
+
+static uint8_t g_hle_arena[64];
+
+static void test_hle_monitor_boundary(void) {
+    AotMemDomain *dom = aot_mem_domain_create();
+    CHECK(dom != NULL, "HLE monitor domain");
+    AotMem mem;
+    CHECK(aot_mem_init(&mem, dom, g_hle_arena, sizeof(g_hle_arena), 0x100000ull) == AOT_MEM_OK,
+          "HLE monitor arena");
+
+    AotImage im = img_base;
+    im.blocks = blocks_svc_ret; im.block_count = 2;
+    im.ranges = range1; im.range_count = 1;
+
+    AotRuntime rt;
+    memset(&rt, 0, sizeof(rt));
+    memset(&g_state, 0, sizeof(g_state));
+    CHECK(aot_rt_init(&rt, &im, mem, &g_state, 10) == AOT_FAULT_NONE,
+          "HLE monitor init");
+    CHECK(aot_rt_set_handler(&rt, AOT_HLE_SVC, 0x40, hle_count, NULL) == 0,
+          "HLE monitor handler");
+    uint64_t v = 0;
+    uint32_t st = 0xEE;
+    CHECK(aot_mem_ldx(&mem, rt.monitor_token, 0x100000ull, 8, &v) == AOT_MEM_OK,
+          "arm before SVC");
+    CHECK(aot_rt_run(&rt, 0x1000ull, 0) == AOT_EXIT_STOP, "SVC run to STOP");
+    CHECK(aot_mem_stx(&mem, rt.monitor_token, 0x100000ull, 8, 0x55ull, &st) == AOT_MEM_OK,
+          "stx after SVC");
+    CHECK(st == 1u, "SVC/HLE boundary clears local monitor");
+    aot_rt_release(&rt);
+
+    /* HOSTCALL thunk delivery must clear the local monitor too. */
+    AotBlockEntry thunk_blocks[2] = { { 0x1000ull, blk_call_thunk },
+                                      { 0x1004ull, blk_ret_stop } };
+    im.blocks = thunk_blocks; im.block_count = 2;
+    im.thunk_base = 0x2000ull; im.thunk_count = 1;
+    im.thunk_stride = AOT_THUNK_STRIDE;
+    memset(&rt, 0, sizeof(rt));
+    memset(&g_state, 0, sizeof(g_state));
+    CHECK(aot_rt_init(&rt, &im, mem, &g_state, 10) == AOT_FAULT_NONE,
+          "HOSTCALL monitor init");
+    CHECK(aot_rt_set_handler(&rt, AOT_HLE_HOSTCALL, 0, hle_count, NULL) == 0,
+          "HOSTCALL handler");
+    g_probe_hle_calls = 0;
+    st = 0xEE;
+    CHECK(aot_mem_ldx(&mem, rt.monitor_token, 0x100000ull, 8, &v) == AOT_MEM_OK,
+          "arm before HOSTCALL");
+    CHECK(aot_rt_run(&rt, 0x1000ull, 0) == AOT_EXIT_STOP, "HOSTCALL run to STOP");
+    CHECK(g_probe_hle_calls == 1, "HOSTCALL handler called");
+    CHECK(aot_mem_stx(&mem, rt.monitor_token, 0x100000ull, 8, 0x66ull, &st) == AOT_MEM_OK,
+          "stx after HOSTCALL");
+    CHECK(st == 1u, "HOSTCALL boundary clears local monitor");
+    aot_rt_release(&rt);
+    aot_mem_domain_destroy(dom);
+}
+
 int main(void) {
+    g_dom = aot_mem_domain_create();
+    if (g_dom == NULL) { printf("FAIL: domain create\n"); return 1; }
     test_image_validate();
     test_init_lookup();
     test_run_stop();
     test_hle();
     test_arena_state();
+    test_exclusive_monitor();
+    test_hle_monitor_boundary();
+    test_release_and_fault_lifecycle();
     test_thunk_transfer();
+    aot_mem_domain_destroy(g_dom);
     if (g_fail) { printf("FAIL: aot_runtime_probe\n"); return 1; }
     printf("PASS: aot_runtime_probe\n");
     return 0;

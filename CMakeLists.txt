@@ -347,6 +347,7 @@ if(MN_BUILD_AOT_PROOF)
         tests/aot/aot_fixture_runner.c
         src/aot/aot_runtime.c
         src/aot/aot_mem.c
+        src/aot/aot_fp.c
         "${AOT_FIXTURE_C}"
     )
     target_include_directories(aot_fixture_runner PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
@@ -397,6 +398,7 @@ if(MN_BUILD_AOT_PROOF)
         tests/aot/aot_bin_runner.c
         src/aot/aot_runtime.c
         src/aot/aot_mem.c
+        src/aot/aot_fp.c
         "${AOT_DIFF_C}"
     )
     target_include_directories(aot_bin_runner PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
@@ -415,7 +417,8 @@ if(MN_BUILD_AOT_PROOF)
 
     # ---- negative controls: real-lowering mutants on separate images ----
     set(AOT_MUT_NAMES wrongcarry lostwzeroext wrongcond blrorder strdrop
-                       scalarupper pair32trunc)
+                       scalarupper pair32trunc fpdropflags stxalwaysok
+                       fproundrn fpnanorder fpignoreguard)
     foreach(mut ${AOT_MUT_NAMES})
         set(AOT_MUT_C   "${AOT_GEN_DIR}/mut_${mut}.c")
         set(AOT_MUT_META "${AOT_GEN_DIR}/mut_${mut}.meta.json")
@@ -435,6 +438,7 @@ if(MN_BUILD_AOT_PROOF)
             tests/aot/aot_bin_runner.c
             src/aot/aot_runtime.c
             src/aot/aot_mem.c
+            src/aot/aot_fp.c
             "${AOT_MUT_C}")
         target_include_directories(aot_mut_${mut} PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
         target_compile_options(aot_mut_${mut} PRIVATE /W4 /WX)
@@ -445,6 +449,7 @@ if(MN_BUILD_AOT_PROOF)
         tests/aot/aot_bin_runner.c
         src/aot/aot_runtime.c
         src/aot/aot_mem.c
+        src/aot/aot_fp.c
         "${AOT_DIFF_C}")
     target_include_directories(aot_mut_hlex18 PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_mut_hlex18 PRIVATE /W4 /WX)
@@ -469,11 +474,150 @@ if(MN_BUILD_AOT_PROOF)
     add_test(NAME aot_runtime_contract COMMAND aot_runtime_probe)
     set_tests_properties(aot_runtime_contract PROPERTIES TIMEOUT 60)
 
+    # Scalar FP core probe: exact integer F32/F64 add/sub/mul/div/compare
+    # contract vectors. No translation, no oracle, no game data.
+    add_executable(aot_fp_probe
+        tests/aot/aot_fp_probe.c
+        src/aot/aot_fp.c)
+    target_include_directories(aot_fp_probe PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_fp_probe PRIVATE /W4 /WX)
+    add_test(NAME aot_fp_core COMMAND aot_fp_probe)
+    set_tests_properties(aot_fp_core PROPERTIES TIMEOUT 60)
+
+    # Native-only translated FP contract probe: links the real generated
+    # differential image and drives the runtime directly. Covers unsupported
+    # FPCR faults (the pinned oracle masks those bits), unrestricted bitwise
+    # FMOV/FABS/FNEG under all-ones FPCR/FPSR, and closed-form translated rows.
+    add_executable(aot_fp_translated_probe
+        tests/aot/aot_fp_translated_probe.c
+        src/aot/aot_runtime.c
+        src/aot/aot_mem.c
+        src/aot/aot_fp.c
+        "${AOT_DIFF_C}")
+    target_include_directories(aot_fp_translated_probe
+        PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_fp_translated_probe PRIVATE /W4 /WX)
+    add_test(NAME aot_fp_translated COMMAND aot_fp_translated_probe)
+    set_tests_properties(aot_fp_translated PROPERTIES TIMEOUT 120)
+
+    # Guard-mutant control: the SAME probe source linked against the
+    # fpignoreguard image (unsupported FPCR is sanitized to 0 instead of
+    # faulting). Positive expectation is a clean STOP that violates the guard
+    # contract; the normal image must NOT be accepted in this mode.
+    add_executable(aot_fp_translated_probe_guardmut
+        tests/aot/aot_fp_translated_probe.c
+        src/aot/aot_runtime.c
+        src/aot/aot_mem.c
+        src/aot/aot_fp.c
+        "${AOT_GEN_DIR}/mut_fpignoreguard.c")
+    add_dependencies(aot_fp_translated_probe_guardmut aot_mut_fpignoreguard)
+    target_include_directories(aot_fp_translated_probe_guardmut
+        PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_fp_translated_probe_guardmut PRIVATE /W4 /WX)
+    add_test(NAME aot_fp_translated_guardmut
+        COMMAND aot_fp_translated_probe_guardmut --expect-guard-reject)
+    set_tests_properties(aot_fp_translated_guardmut PROPERTIES TIMEOUT 120)
+    # Cross-checks (manual evidence, NOT CTest registrations). WILL_FAIL is
+    # forbidden here: a FATAL infrastructure exit(1) would be counted as an
+    # accepted negative. The two cross-checks are recorded manually instead:
+    #   aot_fp_translated_probe --expect-guard-reject   -> exit 1, prints
+    #       "guard mode: image correctly rejected the unsupported FPCR"
+    #   aot_fp_translated_probe_guardmut                -> exit 1, 392 typed
+    #       STOP-instead-of-FAULT mismatches, no FATAL line
+
+
     # Decoder + independent (Capstone) CFG structural test.
     add_test(NAME aot_decoder_cfg
         COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tests/aot/decoder_cfg_test.py"
                 --bin "${AOT_DIFF_BIN}" --meta "${AOT_DIFF_META}"
                 --manifest "${AOT_DIFF_MANIFEST}")
     set_tests_properties(aot_decoder_cfg PROPERTIES TIMEOUT 120
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # ---- translated-memory concurrency probe ---------------------------
+    set(AOT_CONC_S        "${CMAKE_SOURCE_DIR}/tests/aot/fixture_concurrency.s")
+    set(AOT_CONC_MANIFEST "${CMAKE_SOURCE_DIR}/tests/aot/fixture_concurrency.manifest.json")
+    set(AOT_CONC_OBJ      "${AOT_GEN_DIR}/fixture_concurrency.o")
+    set(AOT_CONC_BIN      "${AOT_GEN_DIR}/fixture_concurrency.bin")
+    set(AOT_CONC_C        "${AOT_GEN_DIR}/fixture_concurrency_blocks.c")
+    set(AOT_CONC_MUT_C    "${AOT_GEN_DIR}/fixture_concurrency_mut.c")
+
+    add_custom_command(
+        OUTPUT "${AOT_CONC_BIN}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AOT_GEN_DIR}"
+        COMMAND "${AOT_LLVM_MC}" -triple=aarch64-none-elf -filetype=obj
+                -o "${AOT_CONC_OBJ}" "${AOT_CONC_S}"
+        COMMAND "${AOT_LLVM_OBJCOPY}" -O binary --only-section=.text
+                "${AOT_CONC_OBJ}" "${AOT_CONC_BIN}"
+        DEPENDS "${AOT_CONC_S}"
+        COMMENT "Assembling G2 concurrency ARM64 fixture" VERBATIM)
+
+    add_custom_command(
+        OUTPUT "${AOT_CONC_C}"
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+                --manifest "${AOT_CONC_MANIFEST}" --bin "${AOT_CONC_BIN}"
+                --out "${AOT_CONC_C}" --name conc
+        DEPENDS "${AOT_CONC_BIN}" "${AOT_CONC_MANIFEST}"
+                "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+        COMMENT "Translating G2 concurrency fixture" VERBATIM)
+
+    add_custom_command(
+        OUTPUT "${AOT_CONC_MUT_C}"
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+                --manifest "${AOT_CONC_MANIFEST}" --bin "${AOT_CONC_BIN}"
+                --out "${AOT_CONC_MUT_C}" --name conc_mut --mutant stxalwaysok
+        DEPENDS "${AOT_CONC_BIN}" "${AOT_CONC_MANIFEST}"
+                "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+        COMMENT "Translating G2 concurrency stxalwaysok control" VERBATIM)
+
+    set_source_files_properties("${AOT_CONC_C}" "${AOT_CONC_MUT_C}"
+        PROPERTIES GENERATED TRUE)
+    add_executable(aot_concurrency_probe
+        tests/aot/aot_concurrency_probe.c
+        src/aot/aot_runtime.c
+        src/aot/aot_mem.c
+        src/aot/aot_fp.c
+        "${AOT_CONC_C}"
+        "${AOT_CONC_MUT_C}")
+    target_include_directories(aot_concurrency_probe PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_concurrency_probe PRIVATE /W4 /WX)
+    add_test(NAME aot_concurrency COMMAND aot_concurrency_probe)
+    set_tests_properties(aot_concurrency PROPERTIES TIMEOUT 120)
+
+    # ---- TEST-ONLY wrong-backend control: no store invalidation ----------
+    # Same probe source, IDENTICAL deterministic schedule and explicit
+    # constraint, two separately compiled mem.c instances. The noinv target
+    # compiles the shipping aot_mem.c with AOT_MEM_TEST_NO_INVALIDATION, which
+    # suppresses only mon_invalidate_locked's body (locks, arena registration
+    # and monitor-token lifetime are retained). The real target must OBSERVE the
+    # constraint hold; the noinv target must OBSERVE it violated on status+data.
+    set(AOT_CONC_CONTROL_SOURCES
+        tests/aot/aot_conc_wrongbackend_probe.c
+        src/aot/aot_runtime.c
+        src/aot/aot_mem.c
+        src/aot/aot_fp.c
+        "${AOT_CONC_C}")
+    add_executable(aot_conc_control_real ${AOT_CONC_CONTROL_SOURCES})
+    target_include_directories(aot_conc_control_real PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_conc_control_real PRIVATE /W4 /WX)
+    add_executable(aot_conc_control_noinv ${AOT_CONC_CONTROL_SOURCES})
+    target_include_directories(aot_conc_control_noinv PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_conc_control_noinv PRIVATE /W4 /WX)
+    target_compile_definitions(aot_conc_control_noinv PRIVATE AOT_MEM_TEST_NO_INVALIDATION)
+    add_test(NAME aot_conc_control_real COMMAND aot_conc_control_real)
+    add_test(NAME aot_conc_control_noinv COMMAND aot_conc_control_noinv --expect-reject)
+    set_tests_properties(aot_conc_control_real aot_conc_control_noinv
+        PROPERTIES TIMEOUT 60)
+
+    # Independent (Capstone) CFG + exact-range check for the concurrency
+    # fixture. Deliberately does not trust the translator's emitted meta as
+    # the source of truth, and rejects ranges that cover .org gap/padding
+    # bytes or extend past the raw image.
+    add_test(NAME aot_conc_cfg
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tests/aot/conc_cfg_test.py"
+                --bin "${AOT_CONC_BIN}" --manifest "${AOT_CONC_MANIFEST}"
+                --python "${AOT_PYTHON}"
+                --translator "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py")
+    set_tests_properties(aot_conc_cfg PROPERTIES TIMEOUT 120
         ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 endif()

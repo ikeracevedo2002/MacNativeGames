@@ -14,14 +14,18 @@ Provenance: SHA-256 over fixture bytes + manifest bytes + this generator +
 a config string. The runtime's FNV-1a arena checksum is a quick check only,
 never provenance.
 
-Subset (AOT_SUBSET_ID "g2-core-v1"):
+Subset (AOT_SUBSET_ID "g2-core-v2"):
   ADD/SUB (immediate, shifted register) with/without S
   MOVZ/MOVK
   B, B.cond, CBZ, CBNZ
   BL, BR, BLR, RET
   SVC
+  LDR/STR/LDP/STP (immediate/offset/pre/post), LDXR/STXR family, LDAR
+  FMOV/FABS/FNEG (64-bit bitwise), vector AND/ORR/EOR, byte add/sub
+  F32/F64 FADD/FSUB/FMUL/FDIV/FCMP/FCMPE over the supported FPCR modes
 Correct X/W zero-extension and SP vs XZR selection are enforced. BLR captures
-its source register before x30 is updated (including BLR x30).
+its source register before x30 is updated (including BLR x30). Unsupported
+numeric FPCR modes fault BEFORE any destination/FPSR write.
 """
 
 import argparse
@@ -32,7 +36,7 @@ import sys
 
 # ---------------------------------------------------------------- semantics
 
-AOT_SUBSET_ID = "g2-core-v1"
+AOT_SUBSET_ID = "g2-core-v2"
 AOT_ABI_VERSION = 1
 AOT_STATE_LAYOUT = 1
 TOOL_CONFIG = "aot-translate-stage3/cfg-manifest/c-basicblock/v1"
@@ -40,14 +44,25 @@ TOOL_CONFIG = "aot-translate-stage3/cfg-manifest/c-basicblock/v1"
 # Test-only negative-control selector. None == the real (unmutated) image.
 MUTANT = None
 MUTANTS = ("wrongcarry", "lostwzeroext", "wrongcond", "blrorder",
-           "strdrop", "scalarupper", "pair32trunc")
+           "strdrop", "scalarupper", "pair32trunc",
+           "fpdropflags", "stxalwaysok",
+           "fproundrn", "fpnanorder", "fpignoreguard")
 
 # NZCV helpers are emitted by name; each marks itself used.
 _HELPERS = {}
 _USED = set()
 
+# Provided by the linked aot_fp.c translation unit (declared by aot_fp.h);
+# referenced by name but never emitted into the generated file.
+_EXTERNAL = {"aot_fp_supported",
+             "aot_fp_add32", "aot_fp_add64", "aot_fp_sub32", "aot_fp_sub64",
+             "aot_fp_mul32", "aot_fp_mul64", "aot_fp_div32", "aot_fp_div64",
+             "aot_fp_cmp32", "aot_fp_cmp64"}
+
 
 def use(name):
+    if name in _EXTERNAL:
+        return name
     _USED.add(name)
     return name
 
@@ -182,6 +197,18 @@ static AotExit aot_fault_mem(AotRuntime *rt, uint64_t addr, int64_t status) {
 }
 """
 
+
+_HELPERS["aot_fault_state"] = """
+static AotExit aot_fault_state(AotRuntime *rt, uint64_t src, int64_t status) {
+    rt->fault = AOT_FAULT_BAD_STATE;
+    rt->fault_src = src;
+    rt->fault_target = src;
+    rt->fault_status = status;
+    rt->reason = AOT_EXIT_FAULT;
+    rt->next_pc = src;
+    return AOT_EXIT_FAULT;
+}
+"""
 
 _HELPERS["aot_cond"] = """
 static int aot_cond(const AotGuestState *s, unsigned cond) {
@@ -387,6 +414,77 @@ def decode(pc, word):
                 0x4E208400: "vadd", 0x6E208400: "vsub"}[vec_pattern]
         return {"kind": kind, "pc": pc, "rm": (word >> 16) & 0x1F,
                 "rn": (word >> 5) & 0x1F, "rd": word & 0x1F}
+
+    # ---- Scalar FP two-source: FADD/FSUB/FMUL/FDIV, S and D -----------
+    # Fixed bits 23..21 = 010; bits 15..10 encode the operation; Rm/Rn/Rd
+    # are the only free fields. Other FP2 opcodes (FMAX/FMIN/FMADD/...) do
+    # not match and fail closed.
+    fp2 = word & 0xFFE0FC00
+    fp2_map = {0x1E200800: ("fmul", 32), 0x1E600800: ("fmul", 64),
+               0x1E201800: ("fdiv", 32), 0x1E601800: ("fdiv", 64),
+               0x1E202800: ("fadd", 32), 0x1E602800: ("fadd", 64),
+               0x1E203800: ("fsub", 32), 0x1E603800: ("fsub", 64)}
+    if fp2 in fp2_map:
+        op, width = fp2_map[fp2]
+        return {"kind": op, "pc": pc, "width": width,
+                "rm": (word >> 16) & 0x1F, "rn": (word >> 5) & 0x1F,
+                "rd": word & 0x1F}
+
+    # ---- FCMP/FCMPE (register and #0.0). Bit 4 selects signaling. ------
+    fcmp = word & 0xFFE0FC0F
+    if fcmp in (0x1E202000, 0x1E602000):
+        return {"kind": "fcmp", "pc": pc,
+                "width": 32 if fcmp == 0x1E202000 else 64,
+                "rn": (word >> 5) & 0x1F, "rm": (word >> 16) & 0x1F,
+                "signaling": (word >> 4) & 1}
+    if fcmp in (0x1E202008, 0x1E602008):
+        if ((word >> 16) & 0x1F) != 0:
+            raise DecodeError("FCMP #0.0 Rm field must be zero")
+        return {"kind": "fcmp_zero", "pc": pc,
+                "width": 32 if fcmp == 0x1E202008 else 64,
+                "rn": (word >> 5) & 0x1F,
+                "signaling": (word >> 4) & 1}
+
+    # ---- Exclusive / ordered scalar: LDXR/STXR/LDAXR/STLXR/LDAR/STLR
+    #      (B/H/W/X) -------------------------------------------------- -
+    # size(31:30) is the only operand-size field. Loads and ordered
+    # accesses reserve bits 20:16 (Rs) as 11111; exclusive stores use Rs
+    # as the status register. Separate exact masks keep LDXP/STXP and
+    # reserved Rs field encodings out of the subset (fail closed).
+    # LDAXR/STLXR differ from LDXR/STXR only by bit 15 (acquire/release),
+    # so they share the exclusive-store/load lowering under the shared SC
+    # domain.
+    ex_ld = word & 0x3FFFFC00
+    ex_ld_map = {0x085F7C00: "ldxr", 0x085FFC00: "ldaxr",
+                 0x08DFFC00: "ldar", 0x089FFC00: "stlr"}
+    if ex_ld in ex_ld_map:
+        kind = ex_ld_map[ex_ld]
+        return {"kind": kind, "pc": pc,
+                "width": 8 << ((word >> 30) & 3),
+                "rn": (word >> 5) & 0x1F, "rt": word & 0x1F}
+
+    ex_st = word & 0x3FE0FC00
+    ex_st_map = {0x08007C00: "stxr", 0x0800FC00: "stlxr"}
+    if ex_st in ex_st_map:
+        kind = ex_st_map[ex_st]
+        rs = (word >> 16) & 0x1F
+        rn = (word >> 5) & 0x1F
+        rt = word & 0x1F
+        # ARM STXR/STLXR constrained-unpredictable overlaps (verified
+        # against the published pseudocode):
+        #   s == t (including 31 == 31), or s == n && n != 31.
+        # Rs=31 (WZR status) is fine with Rn=31 (SP) when Rt != 31.
+        if rs == rt or (rs == rn and rn != 31):
+            raise DecodeError("STXR constrained-unpredictable register overlap")
+        return {"kind": kind, "pc": pc,
+                "width": 8 << ((word >> 30) & 3),
+                "rn": rn, "rt": rt, "rs": rs}
+
+    # ---- CLREX and SY barriers (DSB/DMB/ISB); non-SY options fail closed -
+    if word == 0xD5033F5F:
+        return {"kind": "clrex", "pc": pc}
+    if word in (0xD5033FBF, 0xD5033F9F, 0xD5033FDF):
+        return {"kind": "barrier", "pc": pc}
 
     raise DecodeError("unsupported instruction encoding 0x%08x" % word)
 
@@ -720,6 +818,118 @@ def emit_insn(ins, out):
                 newb = "(uint64_t)(uint32_t)(%s)" % newb   # reintroduced old bug
             out.append("        %s(s, %uu, %s);" % (use("aot_set_sp"), ins["rn"], newb))
         out.append("    }")
+    elif k in ("fadd", "fsub", "fmul", "fdiv"):
+        w = ins["width"]
+        fn = use({"fadd": "aot_fp_add32" if w == 32 else "aot_fp_add64",
+                  "fsub": "aot_fp_sub32" if w == 32 else "aot_fp_sub64",
+                  "fmul": "aot_fp_mul32" if w == 32 else "aot_fp_mul64",
+                  "fdiv": "aot_fp_div32" if w == 32 else "aot_fp_div64"}[k])
+        out.append("    rt->site_pc = 0x%xull;" % pc)
+        # Explicit fault BEFORE any destination/FPSR write. A default-NaN
+        # result here would be a silently wrong guest result.
+        out.append("    if (!aot_fp_supported((uint32_t)s->fpcr))")
+        if MUTANT == "fpignoreguard":
+            out.append("        s->fpcr = 0u;   /* mutant: sanitized instead of faulting */")
+        else:
+            out.append("        return %s(rt, 0x%xull, "
+                       "(int64_t)AOT_FP_ERR_UNSUPPORTED_FPCR);"
+                       % (use("aot_fault_state"), pc))
+        out.append("    {")
+        arg1 = "(uint32_t)s->v[%uu][0]" % ins["rn"]
+        arg2 = "(uint32_t)s->v[%uu][0]" % ins["rm"]
+        ctype = "uint32_t"
+        if w == 64:
+            arg1 = "s->v[%uu][0]" % ins["rn"]
+            arg2 = "s->v[%uu][0]" % ins["rm"]
+            ctype = "uint64_t"
+        if MUTANT == "fpnanorder" and k == "fadd":
+            arg1, arg2 = arg2, arg1   # mutant: FADD operand order swapped
+        if MUTANT == "fproundrn":
+            # Mutant: force RN around the helper, then restore the guest FPCR.
+            out.append("        uint64_t aot_save_fpcr = s->fpcr;")
+            out.append("        s->fpcr = aot_save_fpcr & ~0x00c00000ull;")
+            out.append("        %s aot_r = %s(s, %s, %s);" % (ctype, fn, arg1, arg2))
+            out.append("        s->fpcr = aot_save_fpcr;")
+        else:
+            out.append("        %s aot_r = %s(s, %s, %s);" % (ctype, fn, arg1, arg2))
+        if MUTANT == "fpdropflags":
+            out.append("        s->fpsr = 0u;   /* mutant: flags dropped */")
+        out.append("        s->v[%uu][0] = (uint64_t)aot_r;" % ins["rd"])
+        out.append("        s->v[%uu][1] = 0u;" % ins["rd"])
+        out.append("    }")
+    elif k in ("fcmp", "fcmp_zero"):
+        w = ins["width"]
+        fn = use("aot_fp_cmp32" if w == 32 else "aot_fp_cmp64")
+        a = ("(uint32_t)s->v[%uu][0]" if w == 32 else "s->v[%uu][0]") % ins["rn"]
+        if k == "fcmp":
+            b = ("(uint32_t)s->v[%uu][0]" if w == 32 else "s->v[%uu][0]") % ins["rm"]
+        else:
+            b = "0u" if w == 32 else "0ull"
+        out.append("    rt->site_pc = 0x%xull;" % pc)
+        out.append("    if (!aot_fp_supported((uint32_t)s->fpcr))")
+        if MUTANT == "fpignoreguard":
+            out.append("        s->fpcr = 0u;   /* mutant: sanitized instead of faulting */")
+        else:
+            out.append("        return %s(rt, 0x%xull, "
+                       "(int64_t)AOT_FP_ERR_UNSUPPORTED_FPCR);"
+                       % (use("aot_fault_state"), pc))
+        out.append("    s->nzcv = (uint64_t)%s(s, %s, %s, %du);"
+                   % (fn, a, b, ins["signaling"]))
+    elif k in ("ldxr", "ldaxr", "ldar"):
+        w = ins["width"] // 8   # decode width is BITS; helpers take BYTES
+        out.append("    rt->site_pc = 0x%xull;" % pc)
+        out.append("    {")
+        out.append("        uint64_t aot_v = 0u;")
+        out.append("        uint64_t aot_addr = %s(s, %uu);"
+                   % (use("aot_gpr_sp"), ins["rn"]))
+        if k in ("ldxr", "ldaxr"):
+            out.append("        if (rt->monitor_token == 0u) return %s(rt, "
+                       "0x%xull, -1);" % (use("aot_fault_state"), pc))
+            out.append("        AotMemStatus aot_ms = aot_mem_ldx(&rt->mem, "
+                       "rt->monitor_token, aot_addr, %uu, &aot_v);" % w)
+        else:
+            out.append("        AotMemStatus aot_ms = aot_mem_ldar(&rt->mem, "
+                       "aot_addr, %uu, &aot_v);" % w)
+        out.append("        if (aot_ms != AOT_MEM_OK) return %s(rt, aot_addr, "
+                   "(int64_t)aot_ms);" % use("aot_fault_mem"))
+        out.append("        %s(s, %uu, aot_v);" % (use("aot_set_zr"), ins["rt"]))
+        out.append("    }")
+    elif k in ("stxr", "stlxr"):
+        w = ins["width"] // 8   # decode width is BITS; helpers take BYTES
+        out.append("    rt->site_pc = 0x%xull;" % pc)
+        out.append("    {")
+        out.append("        uint64_t aot_addr = %s(s, %uu);"
+                   % (use("aot_gpr_sp"), ins["rn"]))
+        out.append("        uint32_t aot_ok = 1u;")
+        out.append("        if (rt->monitor_token == 0u) return %s(rt, 0x%xull, -1);"
+                   % (use("aot_fault_state"), pc))
+        out.append("        AotMemStatus aot_ms = aot_mem_stx(&rt->mem, "
+                   "rt->monitor_token, aot_addr, %uu, %s(s, %uu), &aot_ok);"
+                   % (w, use("aot_gpr_zr"), ins["rt"]))
+        out.append("        if (aot_ms != AOT_MEM_OK) return %s(rt, aot_addr, "
+                   "(int64_t)aot_ms);" % use("aot_fault_mem"))
+        if MUTANT == "stxalwaysok":
+            out.append("        aot_ok = 0u;   /* mutant: always success */")
+        out.append("        %s(s, %uu, (uint64_t)aot_ok);"
+                   % (use("aot_set_zr"), ins["rs"]))
+        out.append("    }")
+    elif k == "stlr":
+        w = ins["width"] // 8   # decode width is BITS; helpers take BYTES
+        out.append("    rt->site_pc = 0x%xull;" % pc)
+        out.append("    {")
+        out.append("        uint64_t aot_addr = %s(s, %uu);"
+                   % (use("aot_gpr_sp"), ins["rn"]))
+        out.append("        AotMemStatus aot_ms = aot_mem_stlr(&rt->mem, "
+                   "aot_addr, %uu, %s(s, %uu));"
+                   % (w, use("aot_gpr_zr"), ins["rt"]))
+        out.append("        if (aot_ms != AOT_MEM_OK) return %s(rt, aot_addr, "
+                   "(int64_t)aot_ms);" % use("aot_fault_mem"))
+        out.append("    }")
+    elif k == "clrex":
+        out.append("    aot_mem_clrex(&rt->mem, rt->monitor_token);")
+    elif k == "barrier":
+        # SC domain: DMB/DSB/ISB ordering already holds.
+        out.append("    aot_mem_fence();   /* barrier valid as no-op under SC */")
     else:
         raise DecodeError("codegen: unknown kind %s" % k)
 
@@ -732,6 +942,7 @@ def emit_c(name, blocks, ranges, sha, fnv, thunks):
     head.append(" * fixture fnv1a64: 0x%016x (quick check only)" % fnv)
     head.append(" */")
     head.append('#include "aot_runtime.h"')
+    head.append('#include "aot_fp.h"')
     head.append("#include <stdint.h>")
     head.append("")
     # Blocks are emitted first so `use()` records every helper before the

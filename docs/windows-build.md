@@ -74,11 +74,14 @@ the AMD64 box reproduced the expected behaviour). Statuses without
 | Fault/exception handling (VEH/SEH policy) | NOT STARTED — the VM probe's SEH fixture is not runtime fault policy |
 
 Other later-milestone rows (fault/exception handling, the translated
-module loader, guest TLS/TLR and its ABI, and every G2..G8 row) are
-explicitly NOT STARTED, with one scoped exception: a finite-subset G2 AOT
-proof exists behind `-DMN_BUILD_AOT_PROOF=ON` (see `docs/g2-aot-proof.md`,
-D010/D011). **Full G2 is still not closed** (no numerical FP or atomics/ordering; a
-runtime fault policy is a separate G3 row; D008 open). The timing row below
+module loader, guest TLS/TLR and its ABI, and every G3..G8 row) are
+explicitly NOT STARTED. Exception: the scoped finite-subset G2 AOT proof is
+now **locally VALIDATED for its controlled fixtures** behind
+`-DMN_BUILD_AOT_PROOF=ON` (see `docs/g2-aot-proof.md`, D010-D013): the
+controlled subsets include numeric FP and the serialized-SC
+memory/exclusive-monitor model, while full ISA/title/backend parity is NOT
+claimed, a runtime fault policy remains a separate G3 row, and D008 stays
+open. The timing row below
 covers only the host
 monotonic clock; the TLS row covers only the host TLS slot lifecycle;
 the VM/thread/sync/logging rows cover only their host primitives. The

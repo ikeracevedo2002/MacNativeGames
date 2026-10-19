@@ -73,11 +73,52 @@ uint32_t aot_image_validate(const AotImage *img) {
     return AOT_FAULT_NONE;
 }
 
+#define AOT_RT_INIT_MAGIC 0xA07B0001u
+
+void aot_rt_release(AotRuntime *rt) {
+    if (rt == NULL) return;
+    if (rt->init_magic == AOT_RT_INIT_MAGIC) {
+        if (rt->mem.domain != NULL && rt->monitor_token != 0u)
+            aot_mem_domain_detach(rt->mem.domain, rt->monitor_token);
+        rt->monitor_token = 0u;
+        rt->init_magic = 0u;
+        /* Release must leave the runtime NON-runnable: the domain may be
+         * destroyed immediately after the last release, so a later run must
+         * not touch a dangling domain/image. Re-init (which first checks the
+         * magic) is the supported way to reuse the storage. */
+        memset(&rt->mem, 0, sizeof(rt->mem));
+        rt->image = NULL;
+        rt->identity_ok = 0;
+        /* Detach the BORROWED guest state too (release never owns or frees
+         * it). Without this, a later erroneous run would still write
+         * rt->state->pc in fault_out after the caller has freed or poisoned
+         * the backing state. */
+        rt->state = NULL;
+        rt->running = 0;
+    }
+}
+
 uint32_t aot_rt_init(AotRuntime *rt, const AotImage *image, AotMem mem,
                      AotGuestState *state, uint64_t step_budget) {
+    /* The caller must zero the runtime before its first init; after that the
+     * magic lets re-init detach the previous monitor token instead of leaking
+     * a slot in the domain's bounded monitor table. */
+    if (rt->init_magic == AOT_RT_INIT_MAGIC) {
+        if (rt->mem.domain != NULL && rt->monitor_token != 0u)
+            aot_mem_domain_detach(rt->mem.domain, rt->monitor_token);
+    }
     memset(rt, 0, sizeof(*rt));
+    rt->init_magic = AOT_RT_INIT_MAGIC;
+    rt->monitor_token = 0u;
     rt->mem = mem;
     rt->state = state;
+    if (mem.domain != NULL) {
+        rt->monitor_token = aot_mem_domain_attach(mem.domain);
+        if (rt->monitor_token == 0u) {
+            rt_fault(rt, AOT_FAULT_BAD_STATE, 0, 0, -1);
+            return AOT_FAULT_BAD_STATE;
+        }
+    }
     rt->step_budget = step_budget;
     rt->reason = AOT_EXIT_NONE;
     rt->running = 0;
@@ -177,8 +218,18 @@ static uint32_t rt_hle(AotRuntime *rt, uint32_t kind, uint32_t id,
     req.site_pc = site_pc;
     req.resume_pc = resume_pc;
 
+    /* CONSERVATIVE PROOF POLICY, not an ARM exception-entry claim: this G2
+     * proof clears the LOCAL monitor across an SVC/host-call boundary, before
+     * and after, so a handler cannot leave a stale reservation behind. The
+     * handler MUST access guest memory through the shared aot_mem_* API (its
+     * `user` pointer can carry the arena): those calls perform their own
+     * reservation invalidation. This boundary clear is NOT a substitute for
+     * the shared memory API and does not assert wider exception-entry
+     * semantics. */
+    aot_mem_clrex(&rt->mem, rt->monitor_token);
     rt->state->pc = resume_pc;   /* runtime-owned; handler must not rely on it */
     handler(rt->state, &req, user);
+    aot_mem_clrex(&rt->mem, rt->monitor_token);
     rt->state->pc = resume_pc;   /* ignore any handler attempt to redirect */
 
     if (aot_state_validate(rt->state) != AOT_STATE_OK) {
@@ -346,6 +397,9 @@ AotExit aot_rt_run(AotRuntime *rt, uint64_t entry_pc, uint64_t stop_pc) {
     }
 
 fault_out:
+    /* A fault is not a clean stop: conservatively clear this runtime's LOCAL
+     * reservation. The RET/STOP sentinel deliberately preserves it (tested). */
+    aot_mem_clrex(&rt->mem, rt->monitor_token);
     if (rt->state != NULL) rt->state->pc = rt->fault_target;
 done:
     rt->running = 0;

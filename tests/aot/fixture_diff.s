@@ -312,3 +312,148 @@ tgt_add:
     .org 0x18f0
     orr  v3.16b, v1.16b, v3.16b     // 0x18f0 vorr_rd_eq_rm
     ret
+
+// ---- stage-5 scalar FP arithmetic and compare ------------------------
+// Arithmetic cases are seeded through v[] by the differential driver; every
+// case is compared against the Unicorn A57 oracle, including FPSR.
+    .org 0x1900
+    fadd d0, d1, d2                 // 0x1900 fadd_d
+    ret
+    .org 0x1920
+    fsub d0, d1, d2                 // 0x1920 fsub_d
+    ret
+    .org 0x1940
+    fmul d0, d1, d2                 // 0x1940 fmul_d
+    ret
+    .org 0x1960
+    fdiv d0, d1, d2                 // 0x1960 fdiv_d
+    ret
+    .org 0x1980
+    fadd s0, s1, s2                 // 0x1980 fadd_s
+    ret
+    .org 0x19a0
+    fsub s0, s1, s2                 // 0x19a0 fsub_s
+    ret
+    .org 0x19c0
+    fmul s0, s1, s2                 // 0x19c0 fmul_s
+    ret
+    .org 0x19e0
+    fdiv s0, s1, s2                 // 0x19e0 fdiv_s
+    ret
+    .org 0x1a00
+    fcmp d1, d2                     // 0x1a00 fcmp_d
+    ret
+    .org 0x1a20
+    fcmpe d1, d2                    // 0x1a20 fcmpe_d
+    ret
+    .org 0x1a40
+    fcmp s1, s2                     // 0x1a40 fcmp_s
+    ret
+    .org 0x1a60
+    fcmpe s1, s2                    // 0x1a60 fcmpe_s
+    ret
+    .org 0x1a80
+    fcmp d1, #0.0                   // 0x1a80 fcmp_zero_d
+    ret
+    .org 0x1aa0
+    fcmpe s1, #0.0                  // 0x1aa0 fcmpe_zero_s
+    ret
+
+// ---- stage-5 exclusive / ordered scalar + barriers -------------------
+    .org 0x1b00
+    ldxr x0, [x1]                   // 0x1b00 ldxr_x
+    ret
+    .org 0x1b10
+    ldxr w0, [x1]                   // 0x1b10 ldxr_w
+    ret
+    .org 0x1b20
+    ldxrb w0, [x1]                  // 0x1b20 ldxrb
+    ret
+    .org 0x1b30
+    ldxrh w0, [x1]                  // 0x1b30 ldxrh
+    ret
+    .org 0x1b40
+    stxr w3, x0, [x1]               // 0x1b40 stxr_x (no reservation => fail)
+    ret
+    .org 0x1b50
+    stxr w3, w0, [x1]               // 0x1b50 stxr_w
+    ret
+    .org 0x1b60
+    stxrb w3, w0, [x1]              // 0x1b60 stxrb
+    ret
+    .org 0x1b70
+    stxrh w3, w0, [x1]              // 0x1b70 stxrh
+    ret
+    .org 0x1b80
+    ldar x0, [x1]                   // 0x1b80 ldar_x
+    ret
+    .org 0x1b90
+    ldar w0, [x1]                   // 0x1b90 ldar_w
+    ret
+    .org 0x1ba0
+    ldarb w0, [x1]                  // 0x1ba0 ldarb
+    ret
+    .org 0x1bb0
+    ldarh w0, [x1]                  // 0x1bb0 ldarh
+    ret
+    .org 0x1bc0
+    stlr x0, [x1]                   // 0x1bc0 stlr_x
+    ret
+    .org 0x1bd0
+    stlr w0, [x1]                   // 0x1bd0 stlr_w
+    ret
+    .org 0x1be0
+    stlrb w0, [x1]                  // 0x1be0 stlrb
+    ret
+    .org 0x1bf0
+    stlrh w0, [x1]                  // 0x1bf0 stlrh
+    ret
+    .org 0x1c00
+    ldxr x0, [x1]                   // 0x1c00 ldxr_stxr_ok
+    stxr w3, x0, [x1]
+    ret
+    .org 0x1c20
+    ldxr x0, [x1]                   // 0x1c20 ldxr_stxr_other
+    add  x1, x1, #8
+    stxr w3, x0, [x1]
+    ret
+    .org 0x1c40
+    ldxr x0, [x1]                   // 0x1c40 ldxr_str_stxr (same-value/ABA
+    str  x2, [x1]                   //        store must disarm reservation)
+    stxr w3, x0, [x1]
+    ret
+    .org 0x1c60
+    ldxr x0, [x1]                   // 0x1c60 ldxr_stlr_stxr
+    stlr x2, [x1]
+    stxr w3, x0, [x1]
+    ret
+    .org 0x1c80
+    clrex                           // 0x1c80 clrex
+    movz x0, #0x5a5a
+    ret
+    .org 0x1ca0
+    dmb sy                          // 0x1ca0 barriers_noop_under_sc
+    dsb sy
+    isb
+    movz x0, #0x5b5b
+    ret
+    .org 0x1cc0
+    svc  #0x40                      // 0x1cc0 post_svc_fdiv: HLE flips FPCR
+    fdiv s0, s1, s2
+    ret
+    .org 0x1ce0
+    add  x21, x30, #0               // 0x1ce0 post_hostcall_fdiv: preserve the
+    blr  x9                         // RET/STOP sentinel LR across BLR; x21 is
+    fdiv s0, s1, s2                 // NOT mutated by the HLE contract
+    add  x30, x21, #0
+    ret
+    .org 0x1d00
+    svc  #0x40                      // 0x1d00 post_svc_fdiv_d (double)
+    fdiv d0, d1, d2
+    ret
+    .org 0x1d20
+    add  x21, x30, #0               // 0x1d20 post_hostcall_fdiv_d (double)
+    blr  x9
+    fdiv d0, d1, d2
+    add  x30, x21, #0
+    ret

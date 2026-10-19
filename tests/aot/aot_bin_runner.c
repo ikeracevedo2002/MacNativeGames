@@ -96,22 +96,33 @@ static int run_binary(const char *in_path, const char *out_path) {
     fclose(fi);
 
     AotMem mem;
-    if (aot_mem_init(&mem, arena, arena_size, guest_base) != AOT_MEM_OK) {
-        printf("FAIL: aot_mem_init\n"); free(arena); return 2;
+    AotMemDomain *dom = aot_mem_domain_create();
+    if (dom == NULL) {
+        printf("FAIL: aot_mem_domain_create\n"); free(arena); return 2;
     }
+    if (aot_mem_init(&mem, dom, arena, arena_size, guest_base) != AOT_MEM_OK) {
+        printf("FAIL: aot_mem_init\n"); aot_mem_domain_destroy(dom); free(arena); return 2;
+    }
+    /* Once aot_rt_init is attempted, every later exit must release the runtime
+     * before destroying the domain: release detaches the monitor token and
+     * EVERY borrowed pointer (mem/domain, state, image) so no dangling domain
+     * survives. It is idempotent and safe on the zeroed rt. */
     if (aot_rt_init(&rt, &aot_image_diff, mem, &state, budget) != AOT_FAULT_NONE) {
-        printf("FAIL: aot_rt_init\n"); free(arena); return 2;
+        printf("FAIL: aot_rt_init\n"); aot_rt_release(&rt); aot_mem_domain_destroy(dom); free(arena); return 2;
     }
     for (uint32_t i = 0; i < hle_count; i++) {
         if (aot_rt_set_handler(&rt, hk[i], hid[i], hle_mutate, NULL) != 0) {
-            printf("FAIL: set_handler\n"); free(arena); return 2;
+            printf("FAIL: set_handler\n"); aot_rt_release(&rt); aot_mem_domain_destroy(dom); free(arena); return 2;
         }
     }
     rt.trace_enabled = trace_enabled ? 1 : 0;
     AotExit e = aot_rt_run(&rt, entry, stop);
 
     FILE *fo = fopen(out_path, "wb");
-    if (fo == NULL) { printf("FAIL: open output %s\n", out_path); free(arena); return 2; }
+    if (fo == NULL) {
+        printf("FAIL: open output %s\n", out_path);
+        aot_rt_release(&rt); aot_mem_domain_destroy(dom); free(arena); return 2;
+    }
     uint32_t out_magic = OUT_MAGIC, out_ver = FORMAT_VERSION;
     uint32_t o_exit = (uint32_t)e, o_trace_n = 0, o_ev_n = 0;
     uint32_t eof1 = rt.events_overflow, eof2 = rt.trace_overflow;
@@ -133,6 +144,8 @@ static int run_binary(const char *in_path, const char *out_path) {
     ok &= wr(fo, &eof1, 4) && wr(fo, &eof2, 4);
     ok &= wr(fo, &arena_size, 8) && wr(fo, arena, (size_t)arena_size);
     fclose(fo);
+    aot_rt_release(&rt);
+    aot_mem_domain_destroy(dom);
     free(arena);
     if (!ok) { printf("FAIL: write output\n"); return 2; }
     return 0;

@@ -58,11 +58,19 @@ def decoder_tests(a):
     cases = [
         (0x2B6FABFF, "reserved pair word 0x2b6fabff"),
         (0xD61F0010, "BR reserved bits"),
-        (0xC85F7C00, "LDXR/atomic (unsupported)"),
-        (0x1E602820, "unsupported numeric FP (FADD D)"),
+        (0x1E204820, "unsupported numeric FP (FMAX S)"),
+        (0x1E204020, "unsupported FP scalar S (FMOV S)"),
         (0x0B008020, "32-bit addsub overshift imm6=32"),
         (0xA9BF0400, "pair writeback base overlaps transferred reg"),
-        (0x1E204020, "unsupported FP scalar S (FMOV S)"),
+        # Exclusive forms: Rs must be 11111 for loads/ordered accesses.
+        (0xC8407C20, "LDXR reserved Rs field"),
+        (0xC8C0FC20, "LDAR reserved Rs field"),
+        # STXR/STLXR constrained-unpredictable overlaps (published pseudocode):
+        # s==t (including 31==31), or s==n && n!=31.
+        (0xC8007C00, "STXR Rs == Rt (0==0)"),
+        (0xC8017C20, "STXR Rs == Rn (1==1, Rn!=31)"),
+        (0xC81F7FFF, "STXR Rs == Rt == 31"),
+        (0xC800FC00, "STLXR Rs == Rt (0==0)"),
     ]
     for word, label in cases:
         if not expect_decode_error(a, word, label):
@@ -71,11 +79,22 @@ def decoder_tests(a):
         (0x1E604020, "fmov_d", "FMOV D0,D1"),
         (0x1E60C020, "fabs_d", "FABS D0,D1"),
         (0x1E614020, "fneg_d", "FNEG D0,D1"),
+        (0x1E602820, "fadd", "FADD D0,D1,D2"),
         (0x4E221C20, "vand", "AND V0.16B,V1.16B,V2.16B"),
         (0x4EA21C20, "vorr", "ORR V0.16B"),
         (0x6E221C20, "veor", "EOR V0.16B"),
         (0x4E228420, "vadd", "ADD V0.16B"),
         (0x6E228420, "vsub", "SUB V0.16B"),
+        # Exclusive / ordered scalar forms, including acquire/release.
+        (0xC85F7C20, "ldxr", "LDXR X0,[X1]"),
+        (0xC85FFC20, "ldaxr", "LDAXR X0,[X1]"),
+        (0xC8DFFC20, "ldar", "LDAR X0,[X1]"),
+        (0xC89FFC20, "stlr", "STLR X0,[X1]"),
+        (0xC8037C20, "stxr", "STXR W3,X0,[X1]"),
+        (0xC803FC20, "stlxr", "STLXR W3,X0,[X1]"),
+        # Rs=31 (WZR) with Rn=31 (SP) is permitted when Rt!=31.
+        (0xC81F7FE0, "stxr", "STXR WZR,X0,[SP]"),
+        (0xC81F7C00, "stxr", "STXR WZR,X0,[X0]"),
     ]
     for word, kind, label in ok:
         if not expect_decode_ok(a, word, kind, label):
@@ -117,6 +136,60 @@ def comparator_fault_unit():
         if not dd.cmp_case(case, nat, o)[0]:
             print("FAIL: comparator accepted wrong-cause fault (%s)" % label)
             fails = 1
+    return fails
+
+
+def fp_width_validator_unit(bin_bytes):
+    """Committed regression for check_fp_widths deduplication.
+
+    The validator used to deduplicate by (width, op) alone, so a LATER matrix
+    case with the same (width, op) but a different PC was never decoded: a
+    mis-pointed duplicate was invisible (lead-found false positive). These
+    cases use the real fixture bytes; no native execution is needed.
+    """
+    dd = load_driver()
+    cases = dd.make_cases()
+    fails = 0
+    errs = dd.check_fp_widths(bin_bytes, [dict(c) for c in cases])
+    if errs:
+        print("FAIL: fp width validator rejects the real matrix: %s"
+              % "; ".join(errs[:3]))
+        fails = 1
+
+    def expect(mutate, label, token):
+        cs = [dict(c) for c in cases]
+        mutate(cs)
+        e = dd.check_fp_widths(bin_bytes, cs)
+        if not any(token in x for x in e):
+            print("FAIL: fp width validator %s: %s" % (label, e[:3]))
+            return 1
+        return 0
+
+    def late_d_on_s(cs):
+        # NOT the first (d, div) case: the old dedup never looked at it.
+        ds = [c for c in cs if c["name"].startswith("mat_d_div_")]
+        s = next(c for c in cs if c["name"].startswith("mat_s_div_"))
+        ds[-1]["pc"] = s["pc"]
+    fails += expect(late_d_on_s, "late D matrix case on S site",
+                    "width d was requested")
+
+    def late_dup_s_on_d(cs):
+        # Same (width, op) as an earlier case, but a LATER, different PC that
+        # decodes a D instruction: must be rejected.
+        s = next(c for c in cs if c["name"].startswith("mat_s_add_"))
+        dup = dict(s)
+        dup["name"] = "mat_s_add_zz_late_dup"
+        dup["pc"] = 0x1900
+        cs.append(dup)
+    fails += expect(late_dup_s_on_d, "late duplicate S case on D site",
+                    "width s was requested")
+
+    def post_d_on_s(cs):
+        next(c for c in cs if c["name"] == "post_svc_fdiv_d")["pc"] = 0x1CC0
+    fails += expect(post_d_on_s, "post D case on S fdiv",
+                    "width d was requested")
+    if not fails:
+        print("ok fp width validator (real set + 3 mis-pointed sets rejected)")
     return fails
 
 
@@ -320,6 +393,7 @@ def main():
     a = load_ast()
     fails = decoder_tests(a) + manifest_tests(a)
     fails += comparator_fault_unit()
+    fails += fp_width_validator_unit(raw)
     fails += reference_strict_unit(raw, ranges)
     fails += decode_completeness(raw, ranges)
     fails += cfg_test(raw, meta, ranges, entries, indirect, {

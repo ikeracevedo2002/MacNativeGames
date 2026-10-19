@@ -94,6 +94,13 @@ typedef struct AotHleEvent {
 
 struct AotRuntime {
     AotMem mem;
+    /* Exclusive monitor token attached to mem.domain for this runtime's
+     * lifetime (0 = none). It is runtime-owned scratch, NOT guest state, so
+     * the 816-byte AotGuestState ABI is unchanged. Re-init detaches the
+     * previous token; aot_rt_release() detaches explicitly. The storage must
+     * be zero-initialized before the FIRST aot_rt_init. */
+    uint32_t monitor_token;
+    uint32_t init_magic;
     AotGuestState *state;
     const AotImage *image;
     int identity_ok;      /* image identity validated at init */
@@ -141,6 +148,15 @@ struct AotRuntime {
  * NULL only for a runtime that will never dispatch (input validation still
  * runs). Returns AOT_FAULT_NONE or a fault code; image identity, metadata and
  * state invariants are validated fail-closed here. */
+/* Detach this runtime's exclusive-monitor token (idempotent) and detach ALL
+ * borrowed pointers (mem/domain, guest state, image). It never frees or owns
+ * the caller's state or image, and it leaves the runtime non-runnable until a
+ * fresh aot_rt_init. Call when the runtime is finished; reservations do not
+ * survive the domain. A live AotRuntime is single-owner and not copyable: the
+ * caller must not run it concurrently and must not release it concurrently
+ * with a run. */
+void aot_rt_release(AotRuntime *rt);
+
 uint32_t aot_rt_init(AotRuntime *rt, const AotImage *image, AotMem mem,
                      AotGuestState *state, uint64_t step_budget);
 

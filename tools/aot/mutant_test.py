@@ -37,6 +37,10 @@ MUTANTS = {
     "strdrop": ("str_ldr64", "x2"),
     "scalarupper": ("fmov_d", "v0"),
     "hlex18": ("svc_case", "x18"),
+    "fpdropflags": ("fdiv_d", "fpsr"),
+    "stxalwaysok": ("stxr_x", "x3"),
+    "fproundrn": ("fdiv_s_one_third_rm", "v0"),
+    "fpnanorder": ("fadd_s_qnan_op1_preferred", "v0"),
 }
 
 
@@ -145,10 +149,12 @@ def main():
 
     for name, cname, msg in results:
         print("REJECTED %-13s case=%-18s %s" % (name, cname, msg))
+    expected = len(MUTANTS) + 1   # + pair32trunc (separate fault-path control)
+    if len(results) != expected:
+        failures.append("expected exactly %d rejections, got %d"
+                        % (expected, len(results)))
     for f in failures:
         print("  FAIL " + f)
-    if len(results) != 8:
-        failures.append("expected exactly 8 rejections, got %d" % len(results))
     print("aot mutants: rejected=%d infra_failures=%d" % (len(results), len(failures)))
     return 1 if failures else 0
 
