@@ -32,11 +32,14 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/test_romfs_paths.c -o "$RUNNER_TEMP/test-romfs-paths"
           "$RUNNER_TEMP/test-romfs-paths"
 
-  # G1 build-skeleton + host timing + host TLS rows on Windows x64. The
-  # CTest suite covers the build skeleton, the host monotonic clock
-  # conversion/live probes, the host TLS slot lifecycle/isolation probe
-  # and the RomFS path probe. Other G1 items (VM, thread/synchronisation,
-  # faults, guest TLS/ABI) and all later milestones remain NOT STARTED.
+  # G1 build-skeleton + host timing + host TLS + host VM + host thread/sync
+  # + host logging rows on Windows x64. The CTest suite covers the build
+  # skeleton, the host monotonic clock conversion/live probes, the host TLS
+  # slot lifecycle/isolation probe, the host VM region probe, the host thread
+  # lifecycle probe, the host mutex/condition probe, the host core-logging
+  # probe and the RomFS path probe. Later host/runtime boundaries
+  # (fault/exception policy, guest TLS/ABI, guest thread ABI/scheduler) and
+  # all later milestones remain NOT STARTED.
   windows-x64-skeleton:
     runs-on: windows-latest
     timeout-minutes: 10
@@ -52,15 +55,21 @@ jobs:
       # Visual Studio's bundled CMake is on PATH for hosted windows-latest
       # runners; the VS generator auto-detects the MSVC toolchain without
       # requiring an explicit VsDevCmd call.
-      - name: Configure (Visual Studio generator, AMD64)
+      - name: Configure (Visual Studio generator, AMD64, warnings-as-errors)
         shell: cmd
-        run: cmake -S . -B "%BUILD_DIR%" -A x64
+        run: cmake -S . -B "%BUILD_DIR%" -A x64 -DCMAKE_C_FLAGS=/WX
       - name: Build (Debug)
         shell: cmd
         run: cmake --build "%BUILD_DIR%" --config Debug
       - name: ctest (Debug)
         shell: cmd
         run: ctest --test-dir "%BUILD_DIR%" -C Debug --output-on-failure
+      - name: Build (Release)
+        shell: cmd
+        run: cmake --build "%BUILD_DIR%" --config Release
+      - name: ctest (Release)
+        shell: cmd
+        run: ctest --test-dir "%BUILD_DIR%" -C Release --output-on-failure
       - name: Reject unsupported target (external build dir)
         # The CMAKE_SIZEOF_VOID_P guard in CMakeLists.txt must fire when
         # the project is configured for a 32-bit target. CMAKE_SYSTEM_PROCESSOR

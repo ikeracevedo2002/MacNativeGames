@@ -1,7 +1,7 @@
-# Windows x86-64 build (G1 build-skeleton + host timing + host TLS rows)
+# Windows x86-64 build (G1 host-wrapper rows)
 
-This document covers three narrow G1 rows on the `windows-x86-port`
-branch:
+This document covers the narrow G1 host-wrapper rows on the
+`windows-x86-port` branch:
 
 * the **build-skeleton row**: a small Windows x86-64 host executable,
   a platform-neutral RomFS probe compiled unchanged from
@@ -15,17 +15,25 @@ branch:
   (`src/host_tls.h` / `src/host_tls.c`) with a lifecycle + real-thread
   isolation probe that also rejects fixture-only wrong backends (see
   "G1 host TLS slots" below). It is host TLS only: no guest TLS/TLR, no
-  thread-environment object, no key destructor and no guest ABI.
+  thread-environment object, no key destructor and no guest ABI;
+* the **host VM / thread / synchronisation / logging rows**: narrow host
+  primitives (`src/host_vm.*`, `src/host_thread.*`, `src/host_sync.*`,
+  `src/host_log.*`) with probes that reject fixture-only wrong backends
+  (see "G1 host VM, thread, synchronisation and logging" below).
 
-It explicitly does **not** cover: VM, threads/synchronisation, fault
-handling, AOT translation, the translated module loader, guest TLS/TLR
-and its ABI, Horizon services, audio, controller, frontend, graphics,
-packaging, or a reproducible build of the full game. Those rows stay
-`NOT STARTED` / `RESEARCH` in `../PORTING_STATUS.md` until later work
-satisfies their individual exit conditions. In particular, the TLS row
-validates the **host** slot lifecycle against real OS threads; it does
-not implement the guest TLS/TLR mechanism, the Mac thread environment or
-its destructor.
+It explicitly does **not** cover: fault/exception handling, AOT
+translation, the translated module loader, guest TLS/TLR and its ABI,
+the guest thread ABI/scheduler, guest synchronization objects, Horizon
+services, audio, controller, frontend, graphics, packaging, or a
+reproducible build of the full game. Those rows stay `NOT STARTED` /
+`RESEARCH` in `../PORTING_STATUS.md` until later work satisfies their
+individual exit conditions. In particular, the TLS row validates the
+**host** slot lifecycle against real OS threads, and the thread/sync row
+validates **host** threads and the host mutex/condition pair; neither
+implements the guest TLS/TLR mechanism, the guest thread ABI/scheduler,
+the Mac thread environment or its destructor. The VM row is the host
+anonymous-private reserve/commit primitive only; it is not the guest
+address strategy.
 
 There are now **two** independent build paths in the repository:
 
@@ -33,9 +41,10 @@ There are now **two** independent build paths in the repository:
   Apple-silicon native, remains the only path that produces a
   playable game until later Windows rows close.
 * **Windows x86-64 (these rows only)** — `CMakeLists.txt`, builds the
-  small host executable, the unchanged RomFS probe, the host monotonic
-  clock library and its conversion/live tests, and the host TLS slot
-  library and its probe. It does not produce a runnable game.
+  small host executable, the unchanged RomFS probe, and the host
+  libraries and probes for the monotonic clock, TLS slots, virtual
+  memory, threads, mutex/condition variables and core logging. It does
+  not produce a runnable game.
 
 ## Scope matrix for this row
 
@@ -56,12 +65,21 @@ the AMD64 box reproduced the expected behaviour). Statuses without
 | Host monotonic clock library + deterministic conversion tests | VALIDATED (T) — 20 fixed cases + 5 rejected negative controls |
 | Live host clock probe (nondecreasing + unit scale) | VALIDATED (T) — Debug and Release CTest |
 | Host TLS slot library + lifecycle/isolation probe | VALIDATED (T) — host slots only; 5 rejected negative backends |
+| Host VM library + reserve/commit/decommit/protect/query/flush probe | VALIDATED (T) — anonymous private region only; independent raw `VirtualQuery` + SEH guarded-access control |
+| Host thread library + lifecycle probe | VALIDATED (T) — 2 rejected behavioral fakes; self-join and close-while-running phases |
+| Host mutex/condition library + probe | VALIDATED (T) — 4 rejected condition/mutex fakes; no wrong backend is UB |
+| Host core logger + probe | VALIDATED (T) — 4×200 concurrent records + corrupted-stream and broken-sink negatives |
 | Guest TLS/TLR, thread environment, key destructors, guest ABI | NOT STARTED — outside every row so far |
+| Guest thread ABI/scheduler, guest synchronization objects | NOT STARTED — host primitives only |
+| Fault/exception handling (VEH/SEH policy) | NOT STARTED — the VM probe's SEH fixture is not runtime fault policy |
 
-Other G1 platform wrappers (memory, threads/synchronisation, faults)
-and every later milestone (G2..G8) are explicitly NOT STARTED. The
-timing row below covers only the host monotonic clock; the TLS row
-covers only the host TLS slot lifecycle.
+Other later-milestone rows (fault/exception handling, the translated
+module loader, guest TLS/TLR and its ABI, and every G2..G8 row) are
+explicitly NOT STARTED. The timing row below covers only the host
+monotonic clock; the TLS row covers only the host TLS slot lifecycle;
+the VM/thread/sync/logging rows cover only their host primitives. The
+fault/exception row is unchanged: the VM probe's local SEH fixture is a
+probe-local guarded-access control, not a runtime fault policy.
 
 ## G1 host monotonic clock (timing row)
 
@@ -402,6 +420,106 @@ a rejected negative backend.
   lifecycle API: it does not create, start, join or wake threads. The
   thread/synchronisation row remains `NOT STARTED`.
 
+## G1 host VM, thread, synchronisation and logging (host primitives)
+
+These rows add narrow **host** primitives only. They do not implement the
+guest address strategy, the guest thread ABI/scheduler, guest
+synchronization objects or a guest diagnostic service. The Mac sources
+remain the behavioural reference and are unchanged.
+
+### APIs
+
+| Module | Header | Contract (host only) |
+|---|---|---|
+| VM | `src/host_vm.h` | Owning opaque region handle over reserve / commit / decommit / protect / query / flush. Anonymous private pages. **`commit` requires the whole range reserved and rejects any committed/mixed range before any mutating native call** (D009); decommit/protect require every page committed; query reports the OS's own view; zero size is `INVALID_ARGUMENT`. `<windows.h>`-free. |
+| Thread | `src/host_thread.h` | `_beginthreadex`/`_endthreadex` host-C callback, bounded join with `CloseHandle` checked, poll-before-id self-join guard, close-without-wait that does not extend the caller-owned argument's lifetime. `<windows.h>`-free. |
+| Mutex/condition | `src/host_sync.h` | SRWLOCK exclusive + CONDITION_VARIABLE, heap-backed typed handles. Predicate contract: wait may wake spuriously and wakes are not stored; re-check the predicate. On a `host_cond_wait` platform failure the lock state is UNKNOWN (fatal). `<windows.h>`-free. |
+| Logging | `src/host_log.h` | Explicit handle; whole record `[LEVEL] tid=0x<8 hex> <message>\n` formatted then `fwrite`+`fflush` under a per-handle lock; filtering; explicit `...<truncated>` marker; `host_log_close` returns its own flush/close result and always consumes the handle. No timestamps/rotation/callbacks/singleton and no process-global buffering mutation. `<windows.h>`-free. |
+
+### Probes and negative controls
+
+* `tests/host_vm_probe.c`: drives the real backend and checks the OS's own
+  page map with raw `VirtualQuery`, plus a probe-local SEH guarded-access
+  pair (a write/read that must succeed vs. one that must fault). Rejects
+  recommit of RO, RX, all-committed and mixed reserved/committed ranges
+  (protection and contents independently unchanged), zero-size
+  commit/decommit/protect, misaligned/out-of-range/overflow, unknown
+  protect bits, and reserved-page decommit/protect. The SEH fixture is
+  **not** the runtime fault row.
+* `tests/host_thread_probe.c`: real lifecycle battery plus two behavioural
+  fakes (`negative-join-ignores-wait`, `negative-join-always-times-out`)
+  rejected only by the join behaviour they break; real-only self-join,
+  close-while-running (gated worker, later join refused, worker body still
+  runs) and create→join→reuse-spent-handle phases; a failed call must leave
+  the handle's fields unchanged.
+* `tests/host_sync_probe.c`: lifecycle battery (real only, including
+  destroy→reinit), mutex-exclusion
+  battery (real + `negative-mutex-noop`), condition-variable battery (real
+  + `negative-cond-signal-noop`, `negative-cond-broadcast-as-signal`,
+  `negative-cond-wait-times-out`, all using a GENUINE mutex so no wrong
+  backend is UB). A worker `ready` event precedes the exclusion window;
+  bounded predicate loops tolerate spurious wakes; broadcast requires a
+  NON-timeout wake; the timeout is lower-bounded with an independent
+  `QueryPerformanceCounter`; infrastructure failures `FATAL`/`ExitProcess(1)`.
+* `tests/host_log_probe.c`: shape/filter/truncation, CR/LF/NUL normalisation
+  (one call = exactly one line), 4 writers × 200 records verified as one
+  complete non-interleaved stream, a corrupted-stream checker with 5 rejected
+  synthetic negatives (interleaved, unterminated, missing, duplicated,
+  malformed), a failing open must leave the output pointer untouched, and a
+  real `HOST_LOG_ERR_IO` write forced through a `_pipe`/`_dup2` broken-stderr
+  fixture (no public hook); temporary files are removed after each phase.
+
+Exit status is the result in every probe: no `PASS_REGULAR_EXPRESSION`, no
+`WILL_FAIL`, no `assert()`; bounded waits and CTest timeouts guard a wedged
+process.
+
+### Local evidence and commands
+
+External build dirs (with spaces) and the Visual Studio 18 generator:
+
+```cmd
+cmake -S "<repo>" -B "C:\Users\IKER\mn g1\debug" -G "Visual Studio 18 2026" -A x64
+cmake --build "C:\Users\IKER\mn g1\debug" --config Debug
+ctest --test-dir "C:\Users\IKER\mn g1\debug" -C Debug --output-on-failure
+:: same for -C Release in a separate external build dir
+```
+
+Local results (MSVC 19.51, VS 18, `/W4`, no warnings): Debug 10/10 CTest,
+Release 10/10 CTest. Direct probe output (Debug):
+
+```
+checked: 'negative-join-ignores-wait' rejected by 1 check(s)
+checked: 'negative-join-always-times-out' rejected by 1 check(s)
+checked: 'negative-mutex-noop' rejected by 1 check(s)
+checked: 'negative-cond-signal-noop' rejected by 2 check(s)
+checked: 'negative-cond-broadcast-as-signal' rejected by 2 check(s)
+checked: 'negative-cond-wait-times-out' rejected by 5 check(s)
+PASS: host VM reserve/commit/decommit/protect/release/query/flush battery ...
+PASS: host logging battery (4 writers x 200 records) ...
+```
+
+Repetition evidence (out-of-tree logs, not committed): a lead rerun of
+`ctest -R "host_(thread_lifecycle|sync_mutex_cond|vm_region|log)_probe"
+--repeat until-fail:20` in the external Debug and Release build dirs finished
+with ctest exit `0`; each of the four tests ran Start/Passed 20 times (80
+new-probe runs per configuration, 160 total, ~176 s each). This is stability
+evidence only and adds no new exit condition.
+
+The hosted CI configures the same project with `-DCMAKE_C_FLAGS=/WX`, so the
+`/W4` warnings that are clean locally also fail the hosted build.
+
+### Limitations
+
+* The VM `range_all_state` `VirtualQuery`-failure→`PLATFORM` path and the OS
+  `HOST_VM_ERR_ALLOCATION`/`HOST_VM_ERR_PLATFORM` results are implemented but
+  **not forced**. File/COW/alias mapping and fixed guest VA layout are G3.
+* Thread `HOST_THREAD_ERR_WAIT`, sync `HOST_SYNC_ERR_PLATFORM` and backend
+  allocation failures are implemented but **not forced**.
+* `host_log_close`'s OWN flush/close IO failure is **not forced**: stderr is
+  unbuffered, so its close flush is clean (the write path's `ERR_IO` *is*
+  forced). An owned file sink whose `fclose` fails is not exercised.
+* No guest ABI, scheduler, guest objects, fault policy or guest VA strategy.
+
 ## Toolchain requirements
 
 * Windows 10/11 x86-64 host (`AMD64` per `CMAKE_SYSTEM_PROCESSOR`).
@@ -453,6 +571,18 @@ echo host_time_probe exit=%ERRORLEVEL%
 "%TEMP%\mn-build-x64\Debug\host_tls_probe.exe"
 echo host_tls_probe exit=%ERRORLEVEL%
 
+"%TEMP%\mn-build-x64\Debug\host_vm_probe.exe"
+echo host_vm_probe exit=%ERRORLEVEL%
+
+"%TEMP%\mn-build-x64\Debug\host_thread_probe.exe"
+echo host_thread_probe exit=%ERRORLEVEL%
+
+"%TEMP%\mn-build-x64\Debug\host_sync_probe.exe"
+echo host_sync_probe exit=%ERRORLEVEL%
+
+"%TEMP%\mn-build-x64\Debug\host_log_probe.exe"
+echo host_log_probe exit=%ERRORLEVEL%
+
 :: 6. Verify the unsupported-target guard (Win32) fires locally.
 cmake -S "%CD%" -B "%TEMP%\mn-reject-win32" -A Win32 > "%TEMP%\mn-reject-win32.log" 2>&1
 if errorlevel 1 (
@@ -476,6 +606,10 @@ reverse order leaves stderr on the terminal and produces a silent
 | `host_time_convert_test.exe`             | 0             | stdout: `PASS: 20 conversion cases + 5 negative controls`      |
 | `host_time_probe.exe`                    | 0             | stdout: `PASS: live host monotonic clock + scale check; negative controls rejected (...)` |
 | `host_tls_probe.exe`                     | 0             | stdout: five `checked: '<negative>' rejected by ...` lines then `PASS: host TLS slot battery (...)`; the `[coverage]` line is on stdout when native index 0 was observed and on stderr otherwise |
+| `host_vm_probe.exe`                      | 0             | stdout: `PASS: host VM reserve/commit/decommit/protect/release/query/flush battery ...` |
+| `host_thread_probe.exe`                  | 0             | stdout: two `checked: '<negative>' rejected by ...` lines then `PASS: host thread lifecycle battery ...` |
+| `host_sync_probe.exe`                    | 0             | stdout: four `checked: '<negative>' rejected by ...` lines then `PASS: host mutex/condition batteries ...` |
+| `host_log_probe.exe`                     | 0             | stdout: `checked: stream checker rejects ...` then `PASS: host logging battery ...` |
 | `cmake ... -A Win32`                     | non-zero      | configure error containing `supports ONLY 64-bit pointers`    |
 
 The negative-control failure is deliberate: it proves the runtime
@@ -503,13 +637,17 @@ scope for this row.
 
 ## What this row does **not** deliver
 
-* No virtual-memory abstraction (`VirtualAlloc` page-protection
-  tests remain `NOT STARTED`).
+* No guest address strategy: the VM row is the host anonymous private
+  reserve/commit primitive only. File/COW/alias mapping and fixed guest VA
+  layout are G3.
 * No guest TLS/TLR, no thread environment, no key destructor and no
   guest TLS/register ABI. The TLS row above covers the **host** TLS slot
   lifecycle (and only that).
-* No thread pool or synchronisation primitives.
-* No fault / vectored-exception handling probe.
+* No guest thread ABI/scheduler and no guest synchronization objects: the
+  thread/sync rows above cover **host** threads and the host mutex/condition
+  pair only.
+* No fault / vectored-exception handling policy. The VM probe's local SEH
+  fixture is a probe-local guarded-access control, not the fault row.
 * No translated-module loader.
 * No Horizon service ports for the game.
 * No RomFS mounting, save-path or filesystem probe beyond the
@@ -522,7 +660,8 @@ scope for this row.
 * No 1.1.2 / 1.4.3 work.
 
 Treat these rows as evidence that the Windows x86-64 configure / build /
-test path, the host monotonic clock and the host TLS slot lifecycle are
-plausible end-to-end. Do not mark VM, threads/synchronisation, fault
-handling, guest TLS/TLR, downstream G1 or G2..G8 rows complete based on
-them.
+test path and the host monotonic clock, host TLS slots, host virtual
+memory, host threads, host mutex/condition pair and host core logger are
+plausible end-to-end. Do not mark fault/exception handling, guest
+TLS/TLR, the guest thread ABI/scheduler, downstream G1 rows or G2..G8
+rows complete based on them.

@@ -79,3 +79,34 @@ The decision needs evidence from representative ARM64 fixtures and must account 
 - translation time and generated-code performance.
 
 The project should define the guest architectural state/ABI before committing to a backend.
+
+## D009 — Host VM commit requires the whole range reserved
+
+**Status:** Accepted
+
+`host_vm_commit()` requires every page in the requested range to be currently
+`MEM_RESERVE` and rejects any already-committed or mixed reserved/committed
+range with `HOST_VM_ERR_INVALID_STATE` **before** any mutating native call
+(only read-only preflight queries such as `VirtualQuery` run first). It is not
+idempotent, and re-committing is not a supported way to change a page's state.
+
+Reason: `VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)` over an already-committed
+page rewrites its protection. A lead experiment showed an RX(32) page changing
+to RW(4). That would silently weaken a protection the wrapper promised to
+preserve (the Mac loader seals text RX and rodata R with `mprotect`). Requiring
+the whole range reserved and rejecting mixed ranges up front is simpler and
+safer than multi-run partial mutation with rollback: a partial commit could
+leave the range half-changed when a later page fails.
+
+Consequences:
+
+- A caller that wants a fresh zero-filled read/write page must `decommit()`
+  then `commit()`.
+- An "ensure committed" convenience that commits only the reserved pages of a
+  range, if ever wanted, is a separate helper on top of this primitive and is
+  not part of this decision.
+- `range_all_state()` reports a `VirtualQuery` failure as
+  `HOST_VM_ERR_PLATFORM` rather than `HOST_VM_ERR_INVALID_STATE`, so a platform
+  failure cannot be mistaken for a wrong-state rejection.
+- This is a host VM primitive rule only; file/COW/alias mapping and any fixed
+  guest VA layout remain deferred to G3.

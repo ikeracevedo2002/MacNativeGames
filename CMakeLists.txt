@@ -1,4 +1,4 @@
-# Build-skeleton row: Windows x86-64 host probe (G1, narrow scope).
+# Build-skeleton row: Windows x86-64 host probes (G1 host-wrapper rows).
 #
 # What this CMake project does:
 #   - rejects non-Windows and non-AMD64 hosts at configure time
@@ -10,14 +10,20 @@
 #   - compiles the narrow host TLS slot library (TLS row) and its
 #     lifecycle/isolation probe, which also rejects fixture-only wrong
 #     backends with the same battery
+#   - compiles the narrow host thread, mutex/condition-variable, virtual-
+#     memory and core-logging libraries (G1 host rows) and their probes.
+#     Each probe carries the controls its contract needs: the VM probe uses
+#     an independent raw VirtualQuery plus a guarded-access pair, the thread
+#     and sync probes reject fixture-only wrong backends, and the logging
+#     probe rejects corrupted streams plus a forced broken-sink write
 #   - registers a CTest suite whose negative-control test verifies BOTH
 #     the exact non-zero exit code AND the explicit diagnostic via
 #     tests/verify_host_negative_control.cmd
 #
-# What this project does NOT do (G1 is broader than this; see
-# PORTING_STATUS.md): VM, threads/synchronisation, guest TLS or its ABI,
-# loader, AOT translation, graphics, audio, controller, frontend,
-# packaging.
+# What this project does NOT do (see PORTING_STATUS.md): guest threads or
+# their ABI, the guest scheduler, guest synchronization objects,
+# fault/exception handling, the guest virtual-address strategy, loader,
+# AOT translation, graphics, audio, controller, frontend, packaging.
 
 cmake_minimum_required(VERSION 3.20)
 project(MacNativeGamesWinX64 LANGUAGES C)
@@ -128,6 +134,58 @@ add_executable(host_tls_probe
 )
 target_link_libraries(host_tls_probe PRIVATE host_tls)
 
+# Thread row: narrow host thread-lifecycle library. host_thread.c owns the
+# _beginthreadex/WaitForSingleObject/CloseHandle calls; host_thread.h stays
+# free of <windows.h> and of any guest thread/ABI concept.
+add_library(host_thread STATIC
+    src/host_thread.c
+)
+target_include_directories(host_thread PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(host_thread_probe
+    tests/host_thread_probe.c
+)
+target_link_libraries(host_thread_probe PRIVATE host_thread)
+
+# Synchronisation row: narrow host mutex + condition-variable library.
+# host_sync.c owns the SRWLOCK + CONDITION_VARIABLE pair; host_sync.h stays
+# free of <windows.h> and of any guest lock/event/handle concept.
+add_library(host_sync STATIC
+    src/host_sync.c
+)
+target_include_directories(host_sync PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(host_sync_probe
+    tests/host_sync_probe.c
+)
+target_link_libraries(host_sync_probe PRIVATE host_sync)
+
+# Memory row: narrow host virtual-memory library. host_vm.c owns the
+# VirtualAlloc/VirtualFree/VirtualProtect/VirtualQuery/FlushInstructionCache
+# calls behind an owning region handle; host_vm.h stays free of <windows.h>
+# and of any guest address/layout concept.
+add_library(host_vm STATIC
+    src/host_vm.c
+)
+target_include_directories(host_vm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(host_vm_probe
+    tests/host_vm_probe.c
+)
+target_link_libraries(host_vm_probe PRIVATE host_vm)
+
+# Logging row: narrow host core logger. host_log.c owns the sink and record
+# formatting; host_log.h stays free of <windows.h>.
+add_library(host_log STATIC
+    src/host_log.c
+)
+target_include_directories(host_log PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(host_log_probe
+    tests/host_log_probe.c
+)
+target_link_libraries(host_log_probe PRIVATE host_log)
+
 # ---- Tests --------------------------------------------------------------
 
 enable_testing()
@@ -177,3 +235,32 @@ add_test(NAME host_tls_slot_probe
     COMMAND host_tls_probe
 )
 set_tests_properties(host_tls_slot_probe PROPERTIES TIMEOUT 180)
+
+# Host thread lifecycle probe. Exit status only: it fails when the real
+# backend misses a contract check OR when the same battery accepts a
+# deliberately wrong backend. Every phase gate and join has a bounded wait.
+add_test(NAME host_thread_lifecycle_probe
+    COMMAND host_thread_probe
+)
+set_tests_properties(host_thread_lifecycle_probe PROPERTIES TIMEOUT 180)
+
+# Host mutex/condition probe. Exit status only. Bounded waits keep it
+# deterministic; the TIMEOUT only guards a genuinely wedged process.
+add_test(NAME host_sync_mutex_cond_probe
+    COMMAND host_sync_probe
+)
+set_tests_properties(host_sync_mutex_cond_probe PROPERTIES TIMEOUT 180)
+
+# Host virtual-memory probe. Exit status only; it uses a local SEH fixture for
+# guarded accesses and an independent VirtualQuery, not the wrapper.
+add_test(NAME host_vm_region_probe
+    COMMAND host_vm_probe
+)
+set_tests_properties(host_vm_region_probe PROPERTIES TIMEOUT 120)
+
+# Host core-logging probe. Exit status only; the sink-error branch is forced
+# through an external OS pipe, not a public hook.
+add_test(NAME host_log_probe
+    COMMAND host_log_probe
+)
+set_tests_properties(host_log_probe PROPERTIES TIMEOUT 180)

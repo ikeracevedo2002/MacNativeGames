@@ -159,6 +159,31 @@ Windows replacements should implement the existing runtime-facing contracts rath
 | Shader service | macOS arm64 NativeAOT + MSL | win-x64 NativeAOT + backend-neutral output |
 | Build/package | Xcode/Homebrew/.app/signing | Windows toolchain + portable extraction + Windows package |
 
+### G1 host-layer status (narrow)
+
+Of the rows above, only the **host platform layer** has a Windows
+implementation so far, and only as narrow, game-data-free primitives:
+
+- **VM**: `src/host_vm.{h,c}` implements an anonymous private
+  reserve/commit/decommit/protect/query/flush primitive behind an owning
+  handle. It is the host shape of the Mac loader's
+  `mmap(NULL, size, PROT_RW, MAP_PRIVATE|MAP_ANON) + fread`, not a guest
+  address strategy; file/COW/alias mapping and fixed guest VA layout are
+  still open (G3).
+- **Threads**: `src/host_thread.{h,c}` (host `_beginthreadex` lifecycle) and
+  `src/host_sync.{h,c}` (SRWLOCK + CONDITION_VARIABLE) implement HOST
+  threads and the host mutex/condition pair only. The guest thread ABI,
+  guest scheduler, guest synchronization objects and the x64 HLE gate glue
+  remain open.
+- **Timing / TLS / logging**: host monotonic clock (`src/host_time.*`),
+  host TLS slots (`src/host_tls.*`) and a host core logger
+  (`src/host_log.*`) exist as host primitives.
+
+The `Loader/VM`, `Threads` and `HLE gate` rows above therefore remain
+accurate for the *guest-visible* Windows port: none of the guest-facing
+behavior is implemented yet, and the Mac implementation is still the
+reference. Fault tracking is unchanged: no runtime fault policy exists.
+
 ## 4. What should stay conceptually unchanged
 
 Unless evidence proves otherwise, preserve:
