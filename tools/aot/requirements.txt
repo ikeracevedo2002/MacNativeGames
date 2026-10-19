@@ -1,0 +1,11 @@
+# Dev-only dependencies for the G2 AOT proof oracle / decoder checks.
+# Not required to build or run the G1 host tests, and not installed by CMake.
+# The AOT tests are opt-in (MN_BUILD_AOT_PROOF=ON) and expect these imports.
+#
+#   python -m pip install -r tools/aot/requirements.txt
+#
+# Versions are pinned because the differential oracle depends on the exact
+# Unicorn A57 model and Capstone decode behaviour used when the evidence was
+# produced; a different version invalidates the comparison.
+unicorn==2.1.4
+capstone==5.0.7

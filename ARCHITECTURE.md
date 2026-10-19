@@ -82,6 +82,17 @@ The translator must preserve:
 
 The host runtime needs a defined **guest register state ABI** for calls into SVC/HLE helpers. The existing ARM64 gate layout is a useful semantic reference, not reusable x64 code.
 
+**Scoped G2 proof status (D010/D011).** A finite-subset offline C-translation
+path now exists and is opt-in (`-DMN_BUILD_AOT_PROOF=ON`; see
+`docs/g2-aot-proof.md`). It defines the owned `AotGuestState` ABI (816 B,
+8-byte aligned), typed native block exits with the runtime owning PC, and a
+registered typed native HLE handler (host->guest callbacks/reentry are not
+supported). It is verified by a Capstone-derived CFG plus a pinned Unicorn
+A57 differential oracle with real-lowering negative controls. **Full G2 is not
+closed**: it does not cover numerical FP/FPCR/FPSR semantics or
+atomics/ordering (a runtime fault policy is a separate G3 row), and the global
+translated-code backend choice (D008) remains OPEN.
+
 ### Memory model
 
 The Mac implementation assumes relationships between guest virtual addresses, CPU pointers and GPU addresses.

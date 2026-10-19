@@ -75,7 +75,11 @@ the AMD64 box reproduced the expected behaviour). Statuses without
 
 Other later-milestone rows (fault/exception handling, the translated
 module loader, guest TLS/TLR and its ABI, and every G2..G8 row) are
-explicitly NOT STARTED. The timing row below covers only the host
+explicitly NOT STARTED, with one scoped exception: a finite-subset G2 AOT
+proof exists behind `-DMN_BUILD_AOT_PROOF=ON` (see `docs/g2-aot-proof.md`,
+D010/D011). **Full G2 is still not closed** (no numerical FP or atomics/ordering; a
+runtime fault policy is a separate G3 row; D008 open). The timing row below
+covers only the host
 monotonic clock; the TLS row covers only the host TLS slot lifecycle;
 the VM/thread/sync/logging rows cover only their host primitives. The
 fault/exception row is unchanged: the VM probe's local SEH fixture is a

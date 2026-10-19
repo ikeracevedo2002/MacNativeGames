@@ -1,0 +1,6 @@
+{
+  "name": "fixture",
+  "ranges": [[4096, 4608], [8192, 8200]],
+  "entries": [4096],
+  "indirect_targets": [8192]
+}

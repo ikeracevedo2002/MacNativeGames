@@ -23,7 +23,9 @@
 # What this project does NOT do (see PORTING_STATUS.md): guest threads or
 # their ABI, the guest scheduler, guest synchronization objects,
 # fault/exception handling, the guest virtual-address strategy, loader,
-# AOT translation, graphics, audio, controller, frontend, packaging.
+# graphics, audio, controller, frontend, packaging. AOT translation is not
+# built by default; the scoped G2 AOT proof is opt-in via
+# -DMN_BUILD_AOT_PROOF=ON (see docs/g2-aot-proof.md).
 
 cmake_minimum_required(VERSION 3.20)
 project(MacNativeGamesWinX64 LANGUAGES C)
@@ -264,3 +266,214 @@ add_test(NAME host_log_probe
     COMMAND host_log_probe
 )
 set_tests_properties(host_log_probe PROPERTIES TIMEOUT 180)
+
+# ---- G2 AOT proof (stage 1): offline ARM64 -> native C ------------------
+#
+# This is the first translated-execution proof. It is deliberately narrow:
+#   - an owned ARM64 fixture (tests/aot/fixture_arith.s) is assembled OUTSIDE
+#     the source tree with LLVM llvm-mc + llvm-objcopy;
+#   - tools/aot/aot_translate.py decodes it, recovers a CFG from the explicit
+#     manifest and emits straight-line native C basic blocks (no runtime
+#     opcode switch/interpreter/JIT and no ARM64 payload loaded, decoded or
+#     executed at runtime);
+#   - tests/aot/aot_fixture_runner.c drives the existing aot_runtime directly
+#     and checks the expected scalar result plus the SVC HLE event.
+#
+# D008 (full-module backend) stays OPEN; this is scoped evidence only.
+#
+# Opt-in: default OFF so the existing G1 build/CI neither builds nor depends
+# on LLVM, Python, Unicorn or Capstone. Enable with -DMN_BUILD_AOT_PROOF=ON
+# and, on a fresh machine, point the cached tools explicitly, e.g.
+#   -DAOT_LLVM_MC=<...> -DAOT_LLVM_OBJCOPY=<...> -DAOT_PYTHON=<python.exe>
+# The dev-only oracle/decoder deps are pinned in tools/aot/requirements.txt.
+option(MN_BUILD_AOT_PROOF "Build the G2 AOT offline-translation proof (opt-in)" OFF)
+if(MN_BUILD_AOT_PROOF)
+    find_program(AOT_LLVM_MC NAMES llvm-mc llvm-mc.exe)
+    find_program(AOT_LLVM_OBJCOPY NAMES llvm-objcopy llvm-objcopy.exe)
+    set(AOT_PYTHON "" CACHE FILEPATH
+        "Python interpreter for tools/aot; must import unicorn==2.1.4 and capstone==5.0.7")
+    if(NOT AOT_LLVM_MC OR NOT AOT_LLVM_OBJCOPY)
+        message(FATAL_ERROR
+            "MN_BUILD_AOT_PROOF=ON requires llvm-mc and llvm-objcopy. Install "
+            "an LLVM toolchain on PATH and/or pass -DAOT_LLVM_MC=<path> "
+            "-DAOT_LLVM_OBJCOPY=<path>.")
+    endif()
+    if(NOT AOT_PYTHON)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            set(AOT_PYTHON "${Python3_EXECUTABLE}")
+        endif()
+    endif()
+    if(NOT AOT_PYTHON OR NOT EXISTS "${AOT_PYTHON}")
+        message(FATAL_ERROR
+            "MN_BUILD_AOT_PROOF=ON requires a Python interpreter. Pass "
+            "-DAOT_PYTHON=<python.exe>; dev deps are pinned in "
+            "tools/aot/requirements.txt (unicorn==2.1.4, capstone==5.0.7).")
+    endif()
+
+    set(AOT_FIXTURE_S   "${CMAKE_SOURCE_DIR}/tests/aot/fixture_arith.s")
+    set(AOT_MANIFEST    "${CMAKE_SOURCE_DIR}/tests/aot/fixture_arith.manifest.json")
+    set(AOT_GEN_DIR     "${CMAKE_BINARY_DIR}/aot_gen")
+    set(AOT_FIXTURE_OBJ "${AOT_GEN_DIR}/fixture_arith.o")
+    set(AOT_FIXTURE_BIN "${AOT_GEN_DIR}/fixture_arith.bin")
+    set(AOT_FIXTURE_C   "${AOT_GEN_DIR}/fixture_blocks.c")
+
+    add_custom_command(
+        OUTPUT "${AOT_FIXTURE_BIN}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AOT_GEN_DIR}"
+        COMMAND "${AOT_LLVM_MC}" -triple=aarch64-none-elf -filetype=obj
+                -o "${AOT_FIXTURE_OBJ}" "${AOT_FIXTURE_S}"
+        COMMAND "${AOT_LLVM_OBJCOPY}" -O binary --only-section=.text
+                "${AOT_FIXTURE_OBJ}" "${AOT_FIXTURE_BIN}"
+        DEPENDS "${AOT_FIXTURE_S}"
+        COMMENT "Assembling G2 ARM64 fixture with LLVM"
+        VERBATIM)
+
+    add_custom_command(
+        OUTPUT "${AOT_FIXTURE_C}"
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+                --manifest "${AOT_MANIFEST}"
+                --bin "${AOT_FIXTURE_BIN}"
+                --out "${AOT_FIXTURE_C}"
+                --name fixture
+        DEPENDS "${AOT_FIXTURE_BIN}"
+                "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+                "${AOT_MANIFEST}"
+        COMMENT "Translating G2 ARM64 fixture to native C"
+        VERBATIM)
+
+    set_source_files_properties("${AOT_FIXTURE_C}" PROPERTIES GENERATED TRUE)
+    add_executable(aot_fixture_runner
+        tests/aot/aot_fixture_runner.c
+        src/aot/aot_runtime.c
+        src/aot/aot_mem.c
+        "${AOT_FIXTURE_C}"
+    )
+    target_include_directories(aot_fixture_runner PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_fixture_runner PRIVATE /W4 /WX)
+
+    add_test(NAME aot_fixture_stage1
+        COMMAND aot_fixture_runner
+    )
+    set_tests_properties(aot_fixture_stage1 PROPERTIES TIMEOUT 60)
+endif()
+
+# ---- G2 stage-2: differential fixture + binary-I/O native runner -------
+if(MN_BUILD_AOT_PROOF)
+    set(AOT_DIFF_S        "${CMAKE_SOURCE_DIR}/tests/aot/fixture_diff.s")
+    set(AOT_DIFF_MANIFEST "${CMAKE_SOURCE_DIR}/tests/aot/fixture_diff.manifest.json")
+    set(AOT_DIFF_OBJ      "${AOT_GEN_DIR}/fixture_diff.o")
+    set(AOT_DIFF_BIN      "${AOT_GEN_DIR}/fixture_diff.bin")
+    set(AOT_DIFF_C        "${AOT_GEN_DIR}/fixture_diff_blocks.c")
+    set(AOT_DIFF_META     "${AOT_GEN_DIR}/fixture_diff.meta.json")
+
+    add_custom_command(
+        OUTPUT "${AOT_DIFF_BIN}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AOT_GEN_DIR}"
+        COMMAND "${AOT_LLVM_MC}" -triple=aarch64-none-elf -filetype=obj
+                -o "${AOT_DIFF_OBJ}" "${AOT_DIFF_S}"
+        COMMAND "${AOT_LLVM_OBJCOPY}" -O binary --only-section=.text
+                "${AOT_DIFF_OBJ}" "${AOT_DIFF_BIN}"
+        DEPENDS "${AOT_DIFF_S}"
+        COMMENT "Assembling G2 differential ARM64 fixture with LLVM"
+        VERBATIM)
+
+    add_custom_command(
+        OUTPUT "${AOT_DIFF_C}" "${AOT_DIFF_META}"
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+                --manifest "${AOT_DIFF_MANIFEST}"
+                --bin "${AOT_DIFF_BIN}"
+                --out "${AOT_DIFF_C}"
+                --meta-out "${AOT_DIFF_META}"
+                --name diff
+        DEPENDS "${AOT_DIFF_BIN}"
+                "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+                "${AOT_DIFF_MANIFEST}"
+        COMMENT "Translating G2 differential ARM64 fixture to native C"
+        VERBATIM)
+
+    set_source_files_properties("${AOT_DIFF_C}" PROPERTIES GENERATED TRUE)
+    add_executable(aot_bin_runner
+        tests/aot/aot_bin_runner.c
+        src/aot/aot_runtime.c
+        src/aot/aot_mem.c
+        "${AOT_DIFF_C}"
+    )
+    target_include_directories(aot_bin_runner PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_bin_runner PRIVATE /W4 /WX)
+
+    add_test(NAME aot_differential_stage2
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/diff_driver.py"
+                --exe "$<TARGET_FILE:aot_bin_runner>"
+                --bin "${AOT_DIFF_BIN}"
+                --meta "${AOT_DIFF_META}"
+                --manifest "${AOT_DIFF_MANIFEST}"
+                --work "${AOT_GEN_DIR}/diff_cases"
+    )
+    set_tests_properties(aot_differential_stage2 PROPERTIES TIMEOUT 600
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # ---- negative controls: real-lowering mutants on separate images ----
+    set(AOT_MUT_NAMES wrongcarry lostwzeroext wrongcond blrorder strdrop
+                       scalarupper pair32trunc)
+    foreach(mut ${AOT_MUT_NAMES})
+        set(AOT_MUT_C   "${AOT_GEN_DIR}/mut_${mut}.c")
+        set(AOT_MUT_META "${AOT_GEN_DIR}/mut_${mut}.meta.json")
+        add_custom_command(
+            OUTPUT "${AOT_MUT_C}" "${AOT_MUT_META}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${AOT_GEN_DIR}"
+            COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+                    --manifest "${AOT_DIFF_MANIFEST}" --bin "${AOT_DIFF_BIN}"
+                    --out "${AOT_MUT_C}" --meta-out "${AOT_MUT_META}"
+                    --name diff --mutant ${mut}
+            DEPENDS "${AOT_DIFF_BIN}"
+                    "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
+                    "${AOT_DIFF_MANIFEST}"
+            COMMENT "Translating negative-control mutant ${mut}" VERBATIM)
+        set_source_files_properties("${AOT_MUT_C}" PROPERTIES GENERATED TRUE)
+        add_executable(aot_mut_${mut}
+            tests/aot/aot_bin_runner.c
+            src/aot/aot_runtime.c
+            src/aot/aot_mem.c
+            "${AOT_MUT_C}")
+        target_include_directories(aot_mut_${mut} PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_mut_${mut} PRIVATE /W4 /WX)
+    endforeach()
+
+    # HLE-callback mutant (real callback mutation via a test-only compile define).
+    add_executable(aot_mut_hlex18
+        tests/aot/aot_bin_runner.c
+        src/aot/aot_runtime.c
+        src/aot/aot_mem.c
+        "${AOT_DIFF_C}")
+    target_include_directories(aot_mut_hlex18 PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_mut_hlex18 PRIVATE /W4 /WX)
+    target_compile_definitions(aot_mut_hlex18 PRIVATE MN_MUTANT_HLE_X18)
+
+    add_test(NAME aot_mutant_negatives
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/mutant_test.py"
+                --exedir "$<TARGET_FILE_DIR:aot_bin_runner>"
+                --bin "${AOT_DIFF_BIN}" --meta "${AOT_DIFF_META}"
+                --manifest "${AOT_DIFF_MANIFEST}"
+                --work "${AOT_GEN_DIR}/mut_cases")
+    set_tests_properties(aot_mutant_negatives PROPERTIES TIMEOUT 600
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # Runtime contract probe: fake blocks, NOT translation coverage.
+    add_executable(aot_runtime_probe
+        tests/aot/aot_runtime_probe.c
+        src/aot/aot_runtime.c
+        src/aot/aot_mem.c)
+    target_include_directories(aot_runtime_probe PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_runtime_probe PRIVATE /W4 /WX)
+    add_test(NAME aot_runtime_contract COMMAND aot_runtime_probe)
+    set_tests_properties(aot_runtime_contract PROPERTIES TIMEOUT 60)
+
+    # Decoder + independent (Capstone) CFG structural test.
+    add_test(NAME aot_decoder_cfg
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tests/aot/decoder_cfg_test.py"
+                --bin "${AOT_DIFF_BIN}" --meta "${AOT_DIFF_META}"
+                --manifest "${AOT_DIFF_MANIFEST}")
+    set_tests_properties(aot_decoder_cfg PROPERTIES TIMEOUT 120
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+endif()

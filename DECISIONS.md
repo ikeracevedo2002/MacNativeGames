@@ -110,3 +110,50 @@ Consequences:
   failure cannot be mistaken for a wrong-state rejection.
 - This is a host VM primitive rule only; file/COW/alias mapping and any fixed
   guest VA layout remain deferred to G3.
+
+## D010 — Canonical guest-state ABI and finite native block exits
+
+**Status:** Accepted (scoped to the G2 proof; D008 remains OPEN)
+
+The translated-code ABI uses one owned struct `AotGuestState`
+(`src/aot/aot_abi.h`): `x[31]` (x0..x30, with x18 an ordinary guest GPR),
+separate `sp` and `pc`, `nzcv` normalized to bits 31..28, `v[32]` 128-bit
+lanes, low-32 `fpcr`/`fpsr`, `tpidr`/`tpidrro`; 816 bytes, 8-byte aligned
+(no 16-byte promise). Translated blocks are plain C functions using the
+Windows x64 standard compiler ABI; each block returns a typed exit reason and
+the runtime owns PC. There is no opcode decoder/interpreter/JIT and no
+dynamically allocated or written executable code (the static PE `.text` is
+naturally RX); no ARM64 payload is loaded, decoded or executed at runtime.
+There is no host recursion into translated code. HLE is a registered typed
+native C callback (`AotHleHandler`, `void (*)(AotGuestState *,
+const AotHleRequest *, void *)`) that mutates guest state and returns with a
+fixed resume; there are no non-local exits or tail-calls into HLE and
+**host -> guest callback/reentry is not supported**.
+
+Reason: keeps the translated-call ABI small, testable and compiler-neutral
+while avoiding committing to a global backend (D008) prematurely.
+
+Consequences: STOP is only legal immediately after RET (a proof-harness
+sentinel, not a guest thread-exit ABI); numeric FP/FPCR/FPSR semantics and
+atomics/ordering remain PLAN, and a runtime fault policy is a separate G3 row
+(not a G2 exit condition).
+
+## D011 — The C-backend AOT proof is scoped evidence, not the module backend
+
+**Status:** Accepted (D008 remains OPEN)
+
+The G2 proof emits straight-line native C basic blocks from an offline
+exact-mask decode plus an explicit manifest CFG, verified against an
+independent Capstone-derived CFG and a pinned Unicorn A57 differential oracle
+(dev-only). It is opt-in (`MN_BUILD_AOT_PROOF=ON`) so G1 builds need no LLVM /
+Python / Unicorn / Capstone.
+
+Reason: a readable generated-C backend plus installed MSVC gives fast,
+inspectable differential evidence now, without claiming a full-module
+translator or benchmark.
+
+Consequences: the generated-C SHA256 is a config/image fingerprint, **not**
+the real G3 exact-version loader source hash. The full-module backend choice
+(D008) is deliberately left open; FP/atomic architecture and any LLVM vs
+direct-x64 backend comparison are future work. This decision must not be read
+as an implicit acceptance of a global backend.
