@@ -37,7 +37,6 @@ Do not mark a row VALIDATED because it compiles. Add evidence that satisfies the
 | Movie playback | NOT STARTED | VP9 reference probe passes on Windows |
 | First visible game boot | NOT STARTED | G6 checkpoint evidence |
 | Basic gameplay 1.0.0 | NOT STARTED | G7 checklist passes |
-| 1.1.2 support | NOT STARTED | Same acceptance set on 1.1.2 |
 | 1.4.3 support | NOT STARTED | Same acceptance set on 1.4.3 |
 | Windows packaging | NOT STARTED | Clean machine build/package instructions verified |
 | Long-session/performance | NOT STARTED | Repeatable measurements and known issues documented |

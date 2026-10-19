@@ -32,7 +32,7 @@ Do not delete working Mac implementations until the corresponding Windows behavi
 
 **Status:** Accepted
 
-Bring up the smallest existing supported compatibility surface first. Add 1.1.2 and 1.4.3 after the core Windows architecture is validated.
+Bring up the smallest existing supported compatibility surface first. Add 1.4.3 after the core Windows architecture is validated.
 
 This does not change the final goal of supporting all versions currently supported by the Mac port.
 

@@ -89,15 +89,12 @@ After the 1.0.0 path is stable:
 
 ### G8 — Feature/version parity
 
-- 1.0.0, 1.1.2 and 1.4.3 supported.
+- 1.0.0, 1.4.3 supported.
 - Packaging is reproducible.
 - Long-session stability, shader warm-up/cache behavior and performance are documented.
 
 ## Out of scope until the core port works
-
-- 32-bit Windows.
+- Keyboard and mouse full support
 - Linux.
-- macOS refactors unrelated to making the Windows port possible.
-- New gameplay mods/features.
-- Online services.
+- New gameplay mods/features
 - Broad performance tuning before correctness gates pass.
