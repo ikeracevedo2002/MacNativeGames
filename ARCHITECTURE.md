@@ -106,8 +106,8 @@ in `PORTING_STATUS.md` for their controlled subsets. The full-module
 translated-code backend (D008) and the graphics backend (D007) stay **OPEN**;
 G3 module loading/linking and its runtime fault/exception prerequisite
 remain **NOT STARTED**; real game boot belongs to later G4/G6 gates and has
-not begun. The candidate is uncommitted (main checkout on branch `windows-x86-port`,
-clean at `0a30a282`) and requires explicit user approval before integration.
+not begun. The validated proof was integrated into `windows-x86-port` in
+`8793f189` after explicit user approval. Nothing was pushed.
 
 ### Memory model
 

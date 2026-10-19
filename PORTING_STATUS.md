@@ -76,8 +76,9 @@ alias/guest VM/weak-TSO backend, no host->guest callback/reentry, no hardware
 or native-Mac oracle and no hosted CI. **D008 (global backend) and D007
 (graphics backend) remain OPEN; G3 (module loader/linking; the runtime
 fault/exception policy is a separate NOT STARTED prerequisite) has NOT
-STARTED, and real game boot is later still (G4/G6, none begun).** The candidate is uncommitted (main checkout on branch `windows-x86-port`,
-clean at `0a30a282`) and requires **explicit user approval** before integration.
+STARTED, and real game boot is later still (G4/G6, none begun).** The validated
+proof was integrated into `windows-x86-port` in `8793f189` after explicit user
+approval. The integration tree matched the validated worktree; nothing was pushed.
 
 Repetition evidence (out-of-tree logs, not committed): `ctest -R
 "host_(thread_lifecycle|sync_mutex_cond|vm_region|log)_probe" --repeat
@@ -96,15 +97,12 @@ only; it does not close any additional exit condition.
    runtime fault policy is a prerequisite for G3 loader/linking work, not a G2
    controlled-fixture condition.
 3. Windows graphics backend is not selected or implemented (D007 open).
-4. Integration is blocked on **explicit user approval**; nothing is committed
-   or pushed.
 
 ## Next recommended work
 
-1. User reviews and approves (or rejects) integrating the validated G2
-   candidate. This is a user decision, not an automatic next step; do not start
-   G3 before that.
-2. After approval, G3 begins with the translated-image **loader/linking**,
+1. G2 is integrated. Select the next bounded milestone explicitly; the
+   integration request does not automatically start G3.
+2. G3 concerns the translated-image **loader/linking**,
    file/COW/alias mapping and fixed guest VA layout, with the runtime
    **fault/exception policy** (VEH/SEH abstraction) as its separate
    prerequisite. Real game boot is later (G4/G6) and is not part of G3.

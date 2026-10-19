@@ -1,38 +1,44 @@
 # G2 continuation handoff — CURRENT
 
-**Authoritative candidate (this is the latest source):**
-`C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w6-2`,
-branch `pi-agent/w6-2`, base commit `0a30a282`. Its tracked **and untracked**
-files must be preserved exactly; nothing is committed or pushed.
-All session workers are stopped. Worker IDs may not persist across sessions;
-use the absolute candidate path above.
+**Authoritative checkout:**
+`C:/Users/IKER/Documents/CryRecompLAS/MacNativeGames`, branch
+`windows-x86-port`. Explicit user approval was given and the validated G2
+implementation was integrated in commit `8793f189` (previous base `0a30a282`).
+The integration tool verified a byte-identical tree to the validated worktree;
+subsequent integration bookkeeping changes are Markdown only. Nothing was pushed.
+All session workers are stopped. Worker IDs may not persist across sessions.
 
-- `w1-2` is an older **unfinished** worktree and `w5-2` is the **superseded**
-  historical source (the original long handoff lives untouched in `w5-2`).
-  Neither is the latest candidate.
-- The main checkout (**branch `windows-x86-port`**, not a branch named `main`)
-  is **CLEAN** at `0a30a282`. No integration, no commit, no push, no G3 or game
-  inputs. **Explicit user approval is required before any integration.**
+- The retained validation worktree is
+  `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w6-2`,
+  branch `pi-agent/w6-2`, with integration commit `8793f189`. It is an archive,
+  not the authoritative checkout for new work. Do not delete it automatically.
+- `w1-2` is older and unfinished; `w5-2` is the superseded historical source
+  (the original long handoff remains untouched there).
+- No push, G3 work or real game-data work occurred.
 
 **Current exit state:** G2 is **locally validated for the controlled-fixture
-proof** (GOAL.md G2 / Plan Phase 1) and the candidate is **awaiting user
-approval**. G2 is **not already integrated into the main checkout**. D008
-(global backend) and D007 (graphics backend) remain **OPEN**. G3 is the module
+proof** (GOAL.md G2 / Plan Phase 1) and is **integrated after user approval**.
+D008 (global backend) and D007 (graphics backend) remain **OPEN**. G3 is the module
 **loader/linking** step, with the runtime fault/exception policy as its
 separate **NOT STARTED** prerequisite; real **game boot** is later still
 (**G4/G6**), and none of these have begun.
 
-**Next step:** the user reviews and approves (or rejects) integration of this
-candidate. Do **not** automatically start G3, and do not queue follow-up tasks
+**Next step:** explicitly select the next bounded milestone. Do **not**
+automatically start G3, and do not queue follow-up tasks
 before the worker has SETTLED. Harness watchdog: `900000` ms.
 
 ## Lead-verified evidence (external, spaces-in-path builds)
 
-Source is this `w6-2` tree. The **actual final build directories** (both with
-spaces in the path) are:
+Validation used the retained `w6-2` snapshot, whose tree was verified identical
+to integration commit `8793f189`. The **actual final build directories** (both
+with spaces in the path) are:
 
 - AOT ON: `C:/Users/IKER/mn g2 final validation`
 - AOT OFF: `C:/Users/IKER/mn g2 final off`
+- Post-integration main-checkout validation:
+  `C:/Users/IKER/mn g2 integrated validation` — fresh Debug build and **22/22**
+  CTest passed (58.77 s); logs `C:/Users/IKER/mn/g2-integrated-debug-build.log`
+  and `C:/Users/IKER/mn/g2-integrated-debug-ctest.log`.
 
 Build/test logs (not committed):
 
@@ -84,7 +90,7 @@ C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensio
 Configure (AOT proof ON; tool paths are cached after the first configure):
 
 ```
-cmake -S C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w6-2       -B <BUILDDIR> -G "Visual Studio 18 2026" -A x64       -DMN_BUILD_AOT_PROOF=ON       -DAOT_LLVM_MC=C:/Users/IKER/tools/LLVM/bin/llvm-mc.exe       -DAOT_LLVM_OBJCOPY=C:/Users/IKER/tools/LLVM/bin/llvm-objcopy.exe       -DAOT_PYTHON=C:/Users/IKER/AppData/Local/Python/pythoncore-3.14-64/python.exe
+cmake -S C:/Users/IKER/Documents/CryRecompLAS/MacNativeGames       -B <BUILDDIR> -G "Visual Studio 18 2026" -A x64       -DMN_BUILD_AOT_PROOF=ON       -DAOT_LLVM_MC=C:/Users/IKER/tools/LLVM/bin/llvm-mc.exe       -DAOT_LLVM_OBJCOPY=C:/Users/IKER/tools/LLVM/bin/llvm-objcopy.exe       -DAOT_PYTHON=C:/Users/IKER/AppData/Local/Python/pythoncore-3.14-64/python.exe
 ```
 
 Build/test (generated files land in `<BUILDDIR>/aot_gen/`, not `gen/`):

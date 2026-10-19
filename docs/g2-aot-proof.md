@@ -10,10 +10,10 @@ full-ISA parity, not title/game parity and not backend parity: the global
 translated-code backend choice (D008) stays **OPEN**, the graphics backend
 choice (D007) stays **OPEN**, and G3 (module loader/linking; the runtime
 fault/exception policy is a separate prerequisite) has **NOT STARTED**, with
-real game boot later still (G4/G6, none begun). The candidate has **not** been integrated:
-the main checkout (branch `windows-x86-port`) is clean at `0a30a282`, nothing
-is committed or pushed, and **explicit user approval is required before any
-integration**.
+real game boot later still (G4/G6, none begun). The validated proof was
+**integrated into `windows-x86-port` in `8793f189` after explicit user approval**.
+The integration tool verified a byte-identical tree to the validated worktree.
+Nothing was pushed.
 
 Build/test is opt-in and dev-only: `-DMN_BUILD_AOT_PROOF=ON`. The existing G1
 build and CI do not depend on LLVM, Python, Unicorn or Capstone.
@@ -287,5 +287,6 @@ native-Mac oracle and no hosted CI run was involved.
 - No alias/guest-VM behavior, no weak/TSO-style orderings, no FP16/FMA/sqrt/FP
   conversion/full SIMD, no host->guest callback/reentry, no hardware/native-Mac
   oracle, no hosted CI.
-- The candidate is uncommitted; the main checkout (branch `windows-x86-port`)
-  is clean at `0a30a282`. Integration requires **explicit user approval**.
+- Integration was explicitly approved and completed in `8793f189`; no push
+  or G3 work was performed. The retained worktree is a validation snapshot,
+  not the authoritative checkout for subsequent changes.
