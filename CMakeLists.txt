@@ -290,13 +290,39 @@ option(MN_BUILD_AOT_PROOF "Build the G2 AOT offline-translation proof (opt-in)" 
 if(MN_BUILD_AOT_PROOF)
     find_program(AOT_LLVM_MC NAMES llvm-mc llvm-mc.exe)
     find_program(AOT_LLVM_OBJCOPY NAMES llvm-objcopy llvm-objcopy.exe)
+    # G3 module-loader fixtures also need the ELF linker and the readelf the
+    # independent reference checker consumes. They normally sit next to llvm-mc;
+    # default to that directory, and allow an explicit override.
+    if(AOT_LLVM_MC)
+        get_filename_component(AOT_LLVM_BIN_DIR "${AOT_LLVM_MC}" DIRECTORY)
+    endif()
+    # find_program() skips a name that already exists in the cache (even as an
+    # empty string), so each lookup goes through a scratch variable first.
+    set(AOT_LLD "" CACHE FILEPATH "ld.lld for the G3 fixture modules")
+    if(NOT AOT_LLD)
+        find_program(AOT_LLD_FOUND NAMES ld.lld ld.lld.exe
+            HINTS "${AOT_LLVM_BIN_DIR}")
+        if(AOT_LLD_FOUND)
+            set(AOT_LLD "${AOT_LLD_FOUND}" CACHE FILEPATH
+                "ld.lld for the G3 fixture modules" FORCE)
+        endif()
+    endif()
+    set(AOT_LLVM_READELF "" CACHE FILEPATH "llvm-readelf for G3 link checks")
+    if(NOT AOT_LLVM_READELF)
+        find_program(AOT_LLVM_READELF_FOUND NAMES llvm-readelf llvm-readelf.exe
+            HINTS "${AOT_LLVM_BIN_DIR}")
+        if(AOT_LLVM_READELF_FOUND)
+            set(AOT_LLVM_READELF "${AOT_LLVM_READELF_FOUND}" CACHE FILEPATH
+                "llvm-readelf for G3 link checks" FORCE)
+        endif()
+    endif()
     set(AOT_PYTHON "" CACHE FILEPATH
         "Python interpreter for tools/aot; must import unicorn==2.1.4 and capstone==5.0.7")
-    if(NOT AOT_LLVM_MC OR NOT AOT_LLVM_OBJCOPY)
+    if(NOT AOT_LLVM_MC OR NOT AOT_LLVM_OBJCOPY OR NOT AOT_LLD)
         message(FATAL_ERROR
-            "MN_BUILD_AOT_PROOF=ON requires llvm-mc and llvm-objcopy. Install "
-            "an LLVM toolchain on PATH and/or pass -DAOT_LLVM_MC=<path> "
-            "-DAOT_LLVM_OBJCOPY=<path>.")
+            "MN_BUILD_AOT_PROOF=ON requires llvm-mc, llvm-objcopy and ld.lld. "
+            "Install an LLVM toolchain on PATH and/or pass -DAOT_LLVM_MC=<path> "
+            "-DAOT_LLVM_OBJCOPY=<path> -DAOT_LLD=<path>.")
     endif()
     if(NOT AOT_PYTHON)
         find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -310,6 +336,15 @@ if(MN_BUILD_AOT_PROOF)
             "-DAOT_PYTHON=<python.exe>; dev deps are pinned in "
             "tools/aot/requirements.txt (unicorn==2.1.4, capstone==5.0.7).")
     endif()
+
+    # Runtime core shared by every native AOT executable: dispatcher, guest
+    # memory, the G3 address space and the G3 multi-image Program table.
+    set(AOT_CORE_SRC
+        "${CMAKE_SOURCE_DIR}/src/aot/aot_runtime.c"
+        "${CMAKE_SOURCE_DIR}/src/aot/aot_mem.c"
+        "${CMAKE_SOURCE_DIR}/src/aot/aot_as.c"
+        "${CMAKE_SOURCE_DIR}/src/aot/aot_program.c")
+    set(AOT_FP_SRC "${CMAKE_SOURCE_DIR}/src/aot/aot_fp.c")
 
     set(AOT_FIXTURE_S   "${CMAKE_SOURCE_DIR}/tests/aot/fixture_arith.s")
     set(AOT_MANIFEST    "${CMAKE_SOURCE_DIR}/tests/aot/fixture_arith.manifest.json")
@@ -345,13 +380,13 @@ if(MN_BUILD_AOT_PROOF)
     set_source_files_properties("${AOT_FIXTURE_C}" PROPERTIES GENERATED TRUE)
     add_executable(aot_fixture_runner
         tests/aot/aot_fixture_runner.c
-        src/aot/aot_runtime.c
-        src/aot/aot_mem.c
-        src/aot/aot_fp.c
+        ${AOT_CORE_SRC}
+        ${AOT_FP_SRC}
         "${AOT_FIXTURE_C}"
     )
     target_include_directories(aot_fixture_runner PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_fixture_runner PRIVATE /W4 /WX)
+    target_link_libraries(aot_fixture_runner PRIVATE host_vm)
 
     add_test(NAME aot_fixture_stage1
         COMMAND aot_fixture_runner
@@ -368,41 +403,49 @@ if(MN_BUILD_AOT_PROOF)
     set(AOT_DIFF_C        "${AOT_GEN_DIR}/fixture_diff_blocks.c")
     set(AOT_DIFF_META     "${AOT_GEN_DIR}/fixture_diff.meta.json")
 
-    add_custom_command(
-        OUTPUT "${AOT_DIFF_BIN}"
+    # One owning custom target generates EVERY artifact of this fixture family
+    # (object, binary, translated blocks, mutant blocks). Rationale: an
+    # OUTPUT-based add_custom_command whose output is consumed by several
+    # targets is copied into each of their vcxprojs, so parallel MSBuild runs
+    # the same llvm-mc/objcopy/translate sequence concurrently on the same
+    # paths and they clobber each other. With one target, generation happens
+    # exactly once and every consumer only declares an ordering dependency.
+    set(AOT_GEN_DIFF_INPUTS
+        "${AOT_DIFF_S}" "${AOT_DIFF_MANIFEST}"
+        "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py")
+    add_custom_target(aot_gen_diff
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AOT_GEN_DIR}"
         COMMAND "${AOT_LLVM_MC}" -triple=aarch64-none-elf -filetype=obj
                 -o "${AOT_DIFF_OBJ}" "${AOT_DIFF_S}"
         COMMAND "${AOT_LLVM_OBJCOPY}" -O binary --only-section=.text
                 "${AOT_DIFF_OBJ}" "${AOT_DIFF_BIN}"
-        DEPENDS "${AOT_DIFF_S}"
-        COMMENT "Assembling G2 differential ARM64 fixture with LLVM"
-        VERBATIM)
-
-    add_custom_command(
-        OUTPUT "${AOT_DIFF_C}" "${AOT_DIFF_META}"
         COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
                 --manifest "${AOT_DIFF_MANIFEST}"
                 --bin "${AOT_DIFF_BIN}"
                 --out "${AOT_DIFF_C}"
                 --meta-out "${AOT_DIFF_META}"
                 --name diff
-        DEPENDS "${AOT_DIFF_BIN}"
-                "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
-                "${AOT_DIFF_MANIFEST}"
-        COMMENT "Translating G2 differential ARM64 fixture to native C"
-        VERBATIM)
+        DEPENDS ${AOT_GEN_DIFF_INPUTS}
+        COMMENT "Generating G2 differential ARM64 fixture + blocks" VERBATIM)
 
     set_source_files_properties("${AOT_DIFF_C}" PROPERTIES GENERATED TRUE)
+    # The translated blocks are consumed by SEVERAL targets, so they are
+    # compiled ONCE into a static library instead of being listed (and thus
+    # re-compiled / re-generated) in each of them.
+    add_library(aot_diff_blocks STATIC "${AOT_DIFF_C}")
+    add_dependencies(aot_diff_blocks aot_gen_diff)
+    target_include_directories(aot_diff_blocks PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_diff_blocks PRIVATE /W4 /WX)
+
     add_executable(aot_bin_runner
         tests/aot/aot_bin_runner.c
-        src/aot/aot_runtime.c
-        src/aot/aot_mem.c
-        src/aot/aot_fp.c
-        "${AOT_DIFF_C}"
+        ${AOT_CORE_SRC}
+        ${AOT_FP_SRC}
     )
     target_include_directories(aot_bin_runner PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_bin_runner PRIVATE /W4 /WX)
+    target_link_libraries(aot_bin_runner PRIVATE host_vm aot_diff_blocks)
+    add_dependencies(aot_bin_runner aot_gen_diff)
 
     add_test(NAME aot_differential_stage2
         COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/diff_driver.py"
@@ -419,40 +462,39 @@ if(MN_BUILD_AOT_PROOF)
     set(AOT_MUT_NAMES wrongcarry lostwzeroext wrongcond blrorder strdrop
                        scalarupper pair32trunc fpdropflags stxalwaysok
                        fproundrn fpnanorder fpignoreguard)
+    # Every mutant block file is generated by the SAME owning target: they are
+    # all derived from the one fixture binary, so generating them up front
+    # keeps a parallel build from racing on the shared .o/.bin.
     foreach(mut ${AOT_MUT_NAMES})
         set(AOT_MUT_C   "${AOT_GEN_DIR}/mut_${mut}.c")
         set(AOT_MUT_META "${AOT_GEN_DIR}/mut_${mut}.meta.json")
-        add_custom_command(
-            OUTPUT "${AOT_MUT_C}" "${AOT_MUT_META}"
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${AOT_GEN_DIR}"
+        add_custom_command(TARGET aot_gen_diff POST_BUILD
             COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
                     --manifest "${AOT_DIFF_MANIFEST}" --bin "${AOT_DIFF_BIN}"
                     --out "${AOT_MUT_C}" --meta-out "${AOT_MUT_META}"
                     --name diff --mutant ${mut}
-            DEPENDS "${AOT_DIFF_BIN}"
-                    "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
-                    "${AOT_DIFF_MANIFEST}"
             COMMENT "Translating negative-control mutant ${mut}" VERBATIM)
         set_source_files_properties("${AOT_MUT_C}" PROPERTIES GENERATED TRUE)
         add_executable(aot_mut_${mut}
             tests/aot/aot_bin_runner.c
-            src/aot/aot_runtime.c
-            src/aot/aot_mem.c
-            src/aot/aot_fp.c
+            ${AOT_CORE_SRC}
+            ${AOT_FP_SRC}
             "${AOT_MUT_C}")
         target_include_directories(aot_mut_${mut} PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
         target_compile_options(aot_mut_${mut} PRIVATE /W4 /WX)
+        target_link_libraries(aot_mut_${mut} PRIVATE host_vm)
+        add_dependencies(aot_mut_${mut} aot_gen_diff)
     endforeach()
 
     # HLE-callback mutant (real callback mutation via a test-only compile define).
     add_executable(aot_mut_hlex18
         tests/aot/aot_bin_runner.c
-        src/aot/aot_runtime.c
-        src/aot/aot_mem.c
-        src/aot/aot_fp.c
-        "${AOT_DIFF_C}")
+        ${AOT_CORE_SRC}
+        ${AOT_FP_SRC})
     target_include_directories(aot_mut_hlex18 PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_mut_hlex18 PRIVATE /W4 /WX)
+    target_link_libraries(aot_mut_hlex18 PRIVATE host_vm aot_diff_blocks)
+    add_dependencies(aot_mut_hlex18 aot_gen_diff)
     target_compile_definitions(aot_mut_hlex18 PRIVATE MN_MUTANT_HLE_X18)
 
     add_test(NAME aot_mutant_negatives
@@ -467,10 +509,10 @@ if(MN_BUILD_AOT_PROOF)
     # Runtime contract probe: fake blocks, NOT translation coverage.
     add_executable(aot_runtime_probe
         tests/aot/aot_runtime_probe.c
-        src/aot/aot_runtime.c
-        src/aot/aot_mem.c)
+        ${AOT_CORE_SRC})
     target_include_directories(aot_runtime_probe PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_runtime_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_runtime_probe PRIVATE host_vm)
     add_test(NAME aot_runtime_contract COMMAND aot_runtime_probe)
     set_tests_properties(aot_runtime_contract PROPERTIES TIMEOUT 60)
 
@@ -490,13 +532,13 @@ if(MN_BUILD_AOT_PROOF)
     # FMOV/FABS/FNEG under all-ones FPCR/FPSR, and closed-form translated rows.
     add_executable(aot_fp_translated_probe
         tests/aot/aot_fp_translated_probe.c
-        src/aot/aot_runtime.c
-        src/aot/aot_mem.c
-        src/aot/aot_fp.c
-        "${AOT_DIFF_C}")
+        ${AOT_CORE_SRC}
+        ${AOT_FP_SRC})
     target_include_directories(aot_fp_translated_probe
         PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_fp_translated_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_fp_translated_probe PRIVATE host_vm aot_diff_blocks)
+    add_dependencies(aot_fp_translated_probe aot_gen_diff)
     add_test(NAME aot_fp_translated COMMAND aot_fp_translated_probe)
     set_tests_properties(aot_fp_translated PROPERTIES TIMEOUT 120)
 
@@ -506,14 +548,14 @@ if(MN_BUILD_AOT_PROOF)
     # contract; the normal image must NOT be accepted in this mode.
     add_executable(aot_fp_translated_probe_guardmut
         tests/aot/aot_fp_translated_probe.c
-        src/aot/aot_runtime.c
-        src/aot/aot_mem.c
-        src/aot/aot_fp.c
+        ${AOT_CORE_SRC}
+        ${AOT_FP_SRC}
         "${AOT_GEN_DIR}/mut_fpignoreguard.c")
     add_dependencies(aot_fp_translated_probe_guardmut aot_mut_fpignoreguard)
     target_include_directories(aot_fp_translated_probe_guardmut
         PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_fp_translated_probe_guardmut PRIVATE /W4 /WX)
+    target_link_libraries(aot_fp_translated_probe_guardmut PRIVATE host_vm)
     add_test(NAME aot_fp_translated_guardmut
         COMMAND aot_fp_translated_probe_guardmut --expect-guard-reject)
     set_tests_properties(aot_fp_translated_guardmut PROPERTIES TIMEOUT 120)
@@ -542,45 +584,39 @@ if(MN_BUILD_AOT_PROOF)
     set(AOT_CONC_C        "${AOT_GEN_DIR}/fixture_concurrency_blocks.c")
     set(AOT_CONC_MUT_C    "${AOT_GEN_DIR}/fixture_concurrency_mut.c")
 
-    add_custom_command(
-        OUTPUT "${AOT_CONC_BIN}"
+    add_custom_target(aot_gen_conc
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AOT_GEN_DIR}"
         COMMAND "${AOT_LLVM_MC}" -triple=aarch64-none-elf -filetype=obj
                 -o "${AOT_CONC_OBJ}" "${AOT_CONC_S}"
         COMMAND "${AOT_LLVM_OBJCOPY}" -O binary --only-section=.text
                 "${AOT_CONC_OBJ}" "${AOT_CONC_BIN}"
-        DEPENDS "${AOT_CONC_S}"
-        COMMENT "Assembling G2 concurrency ARM64 fixture" VERBATIM)
-
-    add_custom_command(
-        OUTPUT "${AOT_CONC_C}"
         COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
                 --manifest "${AOT_CONC_MANIFEST}" --bin "${AOT_CONC_BIN}"
                 --out "${AOT_CONC_C}" --name conc
-        DEPENDS "${AOT_CONC_BIN}" "${AOT_CONC_MANIFEST}"
-                "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
-        COMMENT "Translating G2 concurrency fixture" VERBATIM)
-
-    add_custom_command(
-        OUTPUT "${AOT_CONC_MUT_C}"
         COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
                 --manifest "${AOT_CONC_MANIFEST}" --bin "${AOT_CONC_BIN}"
                 --out "${AOT_CONC_MUT_C}" --name conc_mut --mutant stxalwaysok
-        DEPENDS "${AOT_CONC_BIN}" "${AOT_CONC_MANIFEST}"
+        DEPENDS "${AOT_CONC_S}" "${AOT_CONC_MANIFEST}"
                 "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py"
-        COMMENT "Translating G2 concurrency stxalwaysok control" VERBATIM)
+        COMMENT "Generating G2 concurrency fixture + blocks" VERBATIM)
 
     set_source_files_properties("${AOT_CONC_C}" "${AOT_CONC_MUT_C}"
         PROPERTIES GENERATED TRUE)
+    # Shared generated blocks: compiled once, linked by the three consumers.
+    add_library(aot_conc_blocks STATIC "${AOT_CONC_C}")
+    add_dependencies(aot_conc_blocks aot_gen_conc)
+    target_include_directories(aot_conc_blocks PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_conc_blocks PRIVATE /W4 /WX)
+
     add_executable(aot_concurrency_probe
         tests/aot/aot_concurrency_probe.c
-        src/aot/aot_runtime.c
-        src/aot/aot_mem.c
-        src/aot/aot_fp.c
-        "${AOT_CONC_C}"
+        ${AOT_CORE_SRC}
+        ${AOT_FP_SRC}
         "${AOT_CONC_MUT_C}")
     target_include_directories(aot_concurrency_probe PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_concurrency_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_concurrency_probe PRIVATE host_vm aot_conc_blocks)
+    add_dependencies(aot_concurrency_probe aot_gen_conc)
     add_test(NAME aot_concurrency COMMAND aot_concurrency_probe)
     set_tests_properties(aot_concurrency PROPERTIES TIMEOUT 120)
 
@@ -593,16 +629,18 @@ if(MN_BUILD_AOT_PROOF)
     # constraint hold; the noinv target must OBSERVE it violated on status+data.
     set(AOT_CONC_CONTROL_SOURCES
         tests/aot/aot_conc_wrongbackend_probe.c
-        src/aot/aot_runtime.c
-        src/aot/aot_mem.c
-        src/aot/aot_fp.c
-        "${AOT_CONC_C}")
+        ${AOT_CORE_SRC}
+        ${AOT_FP_SRC})
     add_executable(aot_conc_control_real ${AOT_CONC_CONTROL_SOURCES})
     target_include_directories(aot_conc_control_real PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_conc_control_real PRIVATE /W4 /WX)
+    target_link_libraries(aot_conc_control_real PRIVATE host_vm aot_conc_blocks)
+    add_dependencies(aot_conc_control_real aot_gen_conc)
     add_executable(aot_conc_control_noinv ${AOT_CONC_CONTROL_SOURCES})
     target_include_directories(aot_conc_control_noinv PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
     target_compile_options(aot_conc_control_noinv PRIVATE /W4 /WX)
+    target_link_libraries(aot_conc_control_noinv PRIVATE host_vm aot_conc_blocks)
+    add_dependencies(aot_conc_control_noinv aot_gen_conc)
     target_compile_definitions(aot_conc_control_noinv PRIVATE AOT_MEM_TEST_NO_INVALIDATION)
     add_test(NAME aot_conc_control_real COMMAND aot_conc_control_real)
     add_test(NAME aot_conc_control_noinv COMMAND aot_conc_control_noinv --expect-reject)
@@ -620,4 +658,627 @@ if(MN_BUILD_AOT_PROOF)
                 --translator "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py")
     set_tests_properties(aot_conc_cfg PROPERTIES TIMEOUT 120
         ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # ---- G3 increment 1: runtime core (address space + Program dispatch) --
+    # These probes use hand-written FAKE blocks at guest virtual addresses.
+    # They are NOT translator output and prove nothing about translation; they
+    # pin the dispatcher/address-space contract only.
+    add_executable(aot_as_probe
+        tests/aot/aot_as_probe.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_as_probe PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_as_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_as_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_as COMMAND aot_as_probe)
+    set_tests_properties(aot_g3_as PROPERTIES TIMEOUT 120)
+
+    add_executable(aot_program_probe
+        tests/aot/aot_program_probe.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_program_probe PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_program_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_program_probe PRIVATE host_vm host_thread)
+    add_test(NAME aot_g3_program COMMAND aot_program_probe)
+    set_tests_properties(aot_g3_program PROPERTIES TIMEOUT 180)
+
+    # Negative controls: the SAME probe source linked against shipping runtime
+    # code compiled with a test-only wrong-implementation switch. Each mutant
+    # executable must exit 2 having printed its specific "FAIL: <check>" line;
+    # g3_mutant_test.py treats anything else (0, 1, crash, timeout, missing
+    # check) as an INFRASTRUCTURE failure.
+    set(AOT_G3_AS_MUTANTS partial_store no_perm host_exec)
+    foreach(mut ${AOT_G3_AS_MUTANTS})
+        string(TOUPPER "${mut}" mut_uc)
+        add_executable(aot_as_mut_${mut}
+            tests/aot/aot_as_probe.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_as_mut_${mut}
+            PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_as_mut_${mut} PRIVATE /W4 /WX)
+        target_link_libraries(aot_as_mut_${mut} PRIVATE host_vm)
+        target_compile_definitions(aot_as_mut_${mut}
+            PRIVATE MN_AOT_MUTANT_${mut_uc})
+    endforeach()
+
+    set(AOT_G3_PROG_MUTANTS thunk_site4 resume_after no_depth_check
+                            no_scratch_save reset_steps
+                            handler_before_resume_check drop_sticky no_abi_check
+                            sysreg_xzr recall_after_fault)
+    foreach(mut ${AOT_G3_PROG_MUTANTS})
+        string(TOUPPER "${mut}" mut_uc)
+        add_executable(aot_prog_mut_${mut}
+            tests/aot/aot_program_probe.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_prog_mut_${mut}
+            PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_prog_mut_${mut} PRIVATE /W4 /WX)
+        target_link_libraries(aot_prog_mut_${mut} PRIVATE host_vm host_thread)
+        target_compile_definitions(aot_prog_mut_${mut}
+            PRIVATE MN_AOT_MUTANT_${mut_uc})
+    endforeach()
+
+    # ---- G3 increment 2: translated-module loader fixtures -------------
+    # Three NSO-like AArch64 modules (main/sub/sdk) assembled with llvm-mc and
+    # linked with ld.lld -shared against tests/aot/g3/nso.ld, then converted to
+    # NSO byte images (.flat) + layout JSON by tools/aot/aot_module.py. Three
+    # link variants exercise the loader's dynamic-section paths:
+    #   v0      : DT_HASH + DT_GNU_HASH, RELA only (TotK 1.0.0 shape)
+    #   relr    : same + DT_RELR packed relative relocations (later firmware)
+    #   gnuonly : DT_GNU_HASH only, no DT_HASH (symbol count from the
+    #             descriptor's pinned dynsym count)
+    # ONE owning target builds everything so a parallel build cannot race on the
+    # shared objects/ELFs (same pattern as aot_gen_diff).
+    set(AOT_G3_DIR       "${AOT_GEN_DIR}/g3")
+    set(AOT_G3_LD_SCRIPT "${CMAKE_SOURCE_DIR}/tests/aot/g3/nso.ld")
+    set(AOT_G3_TOOL      "${CMAKE_SOURCE_DIR}/tools/aot/aot_module.py")
+    set(AOT_G3_MODULES   main sub sdk)
+    # Link order must be sdk -> sub -> main: every module links against the
+    # already-built libraries it references (DT_NEEDED, realistic shape).
+    set(AOT_G3_LINK_ORDER sdk sub main)
+    set(AOT_G3_VARIANTS  v0 relr gnuonly shadow)
+    set(AOT_G3_CONFIG    "${CMAKE_SOURCE_DIR}/tests/aot/g3/link_config.json")
+    set(AOT_G3_CHECK     "${CMAKE_SOURCE_DIR}/tools/aot/g3_link_check.py")
+    set(AOT_G3_TRANSLATE "${CMAKE_SOURCE_DIR}/tools/aot/aot_translate.py")
+    set(AOT_G3_INPUTS    "${AOT_G3_LD_SCRIPT}" "${AOT_G3_TOOL}"
+                         "${AOT_G3_CONFIG}" "${AOT_G3_CHECK}"
+                         "${AOT_G3_TRANSLATE}")
+    foreach(mod ${AOT_G3_MODULES})
+        list(APPEND AOT_G3_INPUTS
+            "${CMAKE_SOURCE_DIR}/tests/aot/g3/fx_${mod}.s")
+    endforeach()
+
+    # ONE owning target: every command goes into a SINGLE add_custom_target
+    # COMMAND list so the execution order is exactly the link/flatten order
+    # (sdk -> sub -> main). Separate add_custom_command(TARGET ...) calls are
+    # emitted as independent MSBuild steps and MSBuild may run them out of
+    # order, which broke the module->dependency link order. It also keeps a
+    # parallel build from racing on the shared .o/.so files.
+    set(AOT_G3_CMDS COMMAND ${CMAKE_COMMAND} -E make_directory "${AOT_G3_DIR}")
+    foreach(mod ${AOT_G3_MODULES})
+        list(APPEND AOT_G3_CMDS
+            COMMAND
+            "${AOT_LLVM_MC}" -triple=aarch64-none-elf -filetype=obj
+            -o "${AOT_G3_DIR}/fx_${mod}.o"
+            "${CMAKE_SOURCE_DIR}/tests/aot/g3/fx_${mod}.s")
+    endforeach()
+
+    foreach(var ${AOT_G3_VARIANTS})
+        if(var STREQUAL "v0")
+            set(AOT_G3_HASH_FLAGS --hash-style=both)
+            set(AOT_G3_RELR_FLAGS "")
+        elseif(var STREQUAL "relr")
+            set(AOT_G3_HASH_FLAGS --hash-style=both)
+            set(AOT_G3_RELR_FLAGS -z pack-relative-relocs)
+        elseif(var STREQUAL "shadow")
+            # Same shape as v0 (DT_HASH + DT_GNU_HASH, no RELR). The only
+            # difference is a main-only injected UNDEFINED STB_WEAK duplicate of
+            # a DEFINED symbol's name, so the variant isolates the resolution
+            # rule "the first DEFINED symbol with a name wins".
+            set(AOT_G3_HASH_FLAGS --hash-style=both)
+            set(AOT_G3_RELR_FLAGS "")
+        else()
+            set(AOT_G3_HASH_FLAGS --hash-style=gnu)
+            set(AOT_G3_RELR_FLAGS "")
+        endif()
+        # Link order sdk -> sub -> main: the later modules reference the
+        # earlier ones and get realistic DT_NEEDED entries.
+        foreach(mod ${AOT_G3_LINK_ORDER})
+            set(AOT_G3_DEPS "")
+            if(mod STREQUAL "sub")
+                set(AOT_G3_DEPS "${AOT_G3_DIR}/libfx_sdk_${var}.so")
+            elseif(mod STREQUAL "main")
+                set(AOT_G3_DEPS "${AOT_G3_DIR}/libfx_sub_${var}.so"
+                                "${AOT_G3_DIR}/libfx_sdk_${var}.so")
+            endif()
+            list(APPEND AOT_G3_CMDS
+                COMMAND
+                "${AOT_LLD}" -shared -z max-page-size=4096
+                -soname libfx_${mod}.so
+                ${AOT_G3_HASH_FLAGS} ${AOT_G3_RELR_FLAGS}
+                -T "${AOT_G3_LD_SCRIPT}"
+                --init=${mod}_init
+                -o "${AOT_G3_DIR}/libfx_${mod}_${var}.so"
+                "${AOT_G3_DIR}/fx_${mod}.o" ${AOT_G3_DEPS})
+            # The `shadow` variant is the negative control for the loader's
+            # symbol index: main gets an UNDEFINED STB_WEAK dynsym entry that
+            # reuses a DEFINED symbol's name at a SMALLER index. The ELF is
+            # patched BEFORE elf2flat, so the flat, the reference linker and the
+            # llvm-readelf checker all see exactly the same bytes.
+            if(var STREQUAL "shadow" AND mod STREQUAL "main")
+                list(APPEND AOT_G3_CMDS
+                    COMMAND
+                    "${AOT_PYTHON}" "${AOT_G3_TOOL}" shadow-undefined
+                    --elf "${AOT_G3_DIR}/libfx_${mod}_${var}.so"
+                    --undef fx_missing_sym --with main_vtable)
+            endif()
+            list(APPEND AOT_G3_CMDS
+                COMMAND
+                "${AOT_PYTHON}" "${AOT_G3_TOOL}" elf2flat
+                --elf "${AOT_G3_DIR}/libfx_${mod}_${var}.so"
+                --name "fx_${mod}_${var}"
+                --out-dir "${AOT_G3_DIR}")
+        endforeach()
+        # Reference linker over the flat images (independent of the ELFs),
+        # then the generated descriptors for the C loader.
+        list(APPEND AOT_G3_CMDS
+            COMMAND
+            "${AOT_PYTHON}" "${AOT_G3_TOOL}" link
+            --config "${AOT_G3_CONFIG}" --dir "${AOT_G3_DIR}"
+            --variant ${var}
+            --out-tsv "${AOT_G3_DIR}/fx_${var}.sites.tsv"
+            --out-counters "${AOT_G3_DIR}/fx_${var}.counters.json"
+            COMMAND
+            "${AOT_PYTHON}" "${AOT_G3_TOOL}" emit-desc
+            --config "${AOT_G3_CONFIG}" --dir "${AOT_G3_DIR}"
+            --variant ${var}
+            --out-c "${AOT_G3_DIR}/g3_desc_${var}.c")
+        # Increment 3: only the v0 variant has translated module images. The
+        # entry discovery and the module-mode translation run AFTER the
+        # reference link of this variant (the TSV is an entry source).
+        if(var STREQUAL "v0")
+            foreach(spec "fx_main_v0:0x1000000000" "fx_sub_v0:0x1001000000"
+                         "fx_sdk_v0:0x1002000000")
+                string(REPLACE ":" ";" spec_parts "${spec}")
+                list(GET spec_parts 0 img_name)
+                list(GET spec_parts 1 img_base)
+                list(APPEND AOT_G3_CMDS
+                    COMMAND
+                    "${AOT_PYTHON}" "${AOT_G3_TOOL}" entries
+                    --flat "${AOT_G3_DIR}/${img_name}.flat"
+                    --layout "${AOT_G3_DIR}/${img_name}.layout.json"
+                    --name "${img_name}" --guest-base "${img_base}"
+                    --link "${AOT_G3_DIR}/fx_${var}.sites.tsv"
+                    --link-module "${img_name}"
+                    --out "${AOT_G3_DIR}/${img_name}.entries.json"
+                    COMMAND
+                    "${AOT_PYTHON}" "${AOT_G3_TRANSLATE}" --module
+                    --flat "${AOT_G3_DIR}/${img_name}.flat"
+                    --layout "${AOT_G3_DIR}/${img_name}.layout.json"
+                    --guest-base "${img_base}"
+                    --entries "${AOT_G3_DIR}/${img_name}.entries.json"
+                    --name "${img_name}"
+                    --out "${AOT_G3_DIR}/${img_name}_blocks.c")
+            endforeach()
+        endif()
+    endforeach()
+
+    # Brief F: MODULE-mode translator mutants. Each mutant image is produced
+    # by the SAME owning target, after the v0 flats/TSV it consumes.
+    foreach(mut adrp_offset orr_noshift stp_split)
+        list(APPEND AOT_G3_CMDS
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${AOT_G3_DIR}/mut_${mut}")
+        foreach(spec "fx_main_v0:0x1000000000" "fx_sub_v0:0x1001000000"
+                     "fx_sdk_v0:0x1002000000")
+            string(REPLACE ":" ";" spec_parts "${spec}")
+            list(GET spec_parts 0 img_name)
+            list(GET spec_parts 1 img_base)
+            list(APPEND AOT_G3_CMDS
+                COMMAND
+                "${AOT_PYTHON}" "${AOT_G3_TRANSLATE}" --module
+                --mutant ${mut}
+                --flat "${AOT_G3_DIR}/${img_name}.flat"
+                --layout "${AOT_G3_DIR}/${img_name}.layout.json"
+                --guest-base "${img_base}"
+                --entries "${AOT_G3_DIR}/${img_name}.entries.json"
+                --name "${img_name}"
+                --out "${AOT_G3_DIR}/mut_${mut}/${img_name}_blocks.c")
+        endforeach()
+    endforeach()
+
+    # T4: mutated flats + their own descriptors. Runs once, after every
+    # variant's flats exist; the generator knows which variant each case needs.
+    list(APPEND AOT_G3_CMDS
+        COMMAND
+        "${AOT_PYTHON}" "${AOT_G3_TOOL}" craft-negative
+        --config "${AOT_G3_CONFIG}" --dir "${AOT_G3_DIR}"
+        --neg-dir "${AOT_G3_DIR}/neg"
+        --out-c "${AOT_G3_DIR}/g3_neg_cases.c")
+
+    # ALL so a plain build leaves the fixtures (and the reference test) ready.
+    add_custom_target(aot_g3_fixtures ALL
+        ${AOT_G3_CMDS}
+        DEPENDS ${AOT_G3_INPUTS}
+        COMMENT "Building G3 module-loader fixtures (3 modules x 3 variants)"
+        VERBATIM)
+
+    # ---- T3: the C loader core and the generated descriptors -----------
+    # aot_loader.c/aot_sha256.c are always compiled (even before the link
+    # probe exists) so the loader cannot rot between turns; the descriptor .c
+    # files are the offline reference linker's output and each variant gets its
+    # own tiny static library g_aot_g3_<variant>_modules[].
+    add_library(aot_g3_loader STATIC
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_loader.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_sha256.c)
+    target_include_directories(aot_g3_loader PUBLIC
+        "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_g3_loader PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_loader PUBLIC host_vm)
+
+    add_executable(aot_sha256_probe
+        tests/aot/aot_sha256_probe.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_sha256.c)
+    target_include_directories(aot_sha256_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_sha256_probe PRIVATE /W4 /WX)
+    add_test(NAME aot_g3_sha256 COMMAND aot_sha256_probe)
+    set_tests_properties(aot_g3_sha256 PROPERTIES TIMEOUT 120)
+
+    foreach(var ${AOT_G3_VARIANTS})
+        set(AOT_G3_DESC_C "${AOT_G3_DIR}/g3_desc_${var}.c")
+        set_source_files_properties("${AOT_G3_DESC_C}" PROPERTIES GENERATED TRUE)
+        add_library(aot_g3_desc_${var} STATIC "${AOT_G3_DESC_C}")
+        target_include_directories(aot_g3_desc_${var} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_g3_desc_${var} PRIVATE /W4 /WX)
+        add_dependencies(aot_g3_desc_${var} aot_g3_fixtures)
+    endforeach()
+
+    # T3 link probe: loads, relocates and seals all three variants through the
+    # generated descriptors and folds the site dump into a TSV the Python
+    # driver compares with the reference linker and g3_link_check.py.
+    add_executable(aot_g3_link_probe tests/aot/aot_g3_link_probe.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_as.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_mem.c)
+    target_include_directories(aot_g3_link_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_g3_link_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_link_probe PRIVATE host_vm aot_g3_loader
+        aot_g3_desc_v0 aot_g3_desc_relr aot_g3_desc_gnuonly aot_g3_desc_shadow
+        aot_g3_blocks_v0)
+    add_dependencies(aot_g3_link_probe aot_g3_fixtures)
+
+    # G3 increment 3: the translated v0 module images as one static library
+    # (aot_translate.py --module output) and the first execution probe.
+    set(AOT_G3_BLOCKS_C
+        "${AOT_G3_DIR}/fx_main_v0_blocks.c"
+        "${AOT_G3_DIR}/fx_sub_v0_blocks.c"
+        "${AOT_G3_DIR}/fx_sdk_v0_blocks.c")
+    set_source_files_properties(${AOT_G3_BLOCKS_C} PROPERTIES GENERATED TRUE)
+    add_library(aot_g3_blocks_v0 STATIC ${AOT_G3_BLOCKS_C})
+    target_include_directories(aot_g3_blocks_v0 PUBLIC
+        "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_g3_blocks_v0 PRIVATE /W4 /WX)
+    add_dependencies(aot_g3_blocks_v0 aot_g3_fixtures)
+
+    add_executable(aot_g3_exec_probe tests/aot/aot_g3_exec_probe.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_prog_assembly.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_exec_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_g3_exec_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_exec_probe PRIVATE host_vm host_thread
+        host_time aot_g3_loader aot_g3_desc_v0 aot_g3_desc_relr
+        aot_g3_blocks_v0)
+    add_dependencies(aot_g3_exec_probe aot_g3_fixtures)
+    add_test(NAME aot_g3_exec COMMAND aot_g3_exec_probe "${AOT_G3_DIR}")
+    set_tests_properties(aot_g3_exec PROPERTIES TIMEOUT 180)
+
+    # ---- Brief F: exec negative controls -------------------------------
+    # (a) translator mutants: the same probe over mutant translated blocks;
+    # (b) loader/program mutants: the same probe over one test-only compile
+    # define. Each must be REJECTED by its specific check (see
+    # tools/aot/g3_exec_mutant_test.py) -- a survivor means the check is
+    # vacuous.
+    set(AOT_G3_MUT_EXES "")
+    foreach(mut adrp_offset orr_noshift stp_split)
+        set(AOT_G3_MUT_BLOCKS
+            "${AOT_G3_DIR}/mut_${mut}/fx_main_v0_blocks.c"
+            "${AOT_G3_DIR}/mut_${mut}/fx_sub_v0_blocks.c"
+            "${AOT_G3_DIR}/mut_${mut}/fx_sdk_v0_blocks.c")
+        set_source_files_properties(${AOT_G3_MUT_BLOCKS} PROPERTIES
+            GENERATED TRUE)
+        add_library(aot_g3_blocks_v0_${mut} STATIC ${AOT_G3_MUT_BLOCKS})
+        target_include_directories(aot_g3_blocks_v0_${mut} PUBLIC
+            "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_g3_blocks_v0_${mut} PRIVATE /W4 /WX)
+        add_dependencies(aot_g3_blocks_v0_${mut} aot_g3_fixtures)
+        add_executable(aot_g3_exec_probe_mut_${mut}
+            tests/aot/aot_g3_exec_probe.c
+            ${CMAKE_SOURCE_DIR}/src/aot/aot_prog_assembly.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_g3_exec_probe_mut_${mut} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_g3_exec_probe_mut_${mut} PRIVATE /W4 /WX)
+        target_link_libraries(aot_g3_exec_probe_mut_${mut} PRIVATE
+            host_vm host_thread host_time aot_g3_loader aot_g3_desc_v0
+            aot_g3_desc_relr aot_g3_blocks_v0_${mut})
+        add_dependencies(aot_g3_exec_probe_mut_${mut} aot_g3_fixtures)
+        list(APPEND AOT_G3_MUT_EXES aot_g3_exec_probe_mut_${mut})
+    endforeach()
+
+    foreach(mut init_array_walk image_unbound)
+        string(TOUPPER ${mut} mut_upper)
+        add_executable(aot_g3_exec_probe_mut_${mut}
+            tests/aot/aot_g3_exec_probe.c
+            ${CMAKE_SOURCE_DIR}/src/aot/aot_prog_assembly.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_g3_exec_probe_mut_${mut} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_g3_exec_probe_mut_${mut} PRIVATE /W4 /WX)
+        target_compile_definitions(aot_g3_exec_probe_mut_${mut} PRIVATE
+            MN_AOT_MUTANT_${mut_upper})
+        target_link_libraries(aot_g3_exec_probe_mut_${mut} PRIVATE
+            host_vm host_thread host_time aot_g3_loader aot_g3_desc_v0
+            aot_g3_desc_relr aot_g3_blocks_v0)
+        add_dependencies(aot_g3_exec_probe_mut_${mut} aot_g3_fixtures)
+        list(APPEND AOT_G3_MUT_EXES aot_g3_exec_probe_mut_${mut})
+    endforeach()
+
+    # Brief F: module-mode decoder cross-check against Capstone 5.0.7.
+    add_test(NAME aot_g3_decoder_module
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_decoder_module_test.py"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot")
+    set_tests_properties(aot_g3_decoder_module PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    add_test(NAME aot_g3_exec_mutants
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tools/aot/g3_exec_mutant_test.py"
+                --exe-dir "$<TARGET_FILE_DIR:aot_g3_exec_probe>"
+                --fixtures "${AOT_G3_DIR}")
+    set_tests_properties(aot_g3_exec_mutants PROPERTIES TIMEOUT 600
+                         DEPENDS "aot_g3_exec;aot_g3_exec_oracle")
+
+    # G3 increment 3 brief E: differential oracle. The native probe dumps the
+    # non-nested scenarios (final x0..x30/sp/nzcv + per-module data digests)
+    # and tools/aot/g3_exec_oracle.py replays them on Unicorn 2.1.4 (A57) and
+    # compares field by field. It also runs its own --perturb negative control.
+    add_test(NAME aot_g3_exec_oracle
+             COMMAND "${AOT_PYTHON}"
+                     "${CMAKE_SOURCE_DIR}/tools/aot/g3_exec_oracle.py"
+                     --probe $<TARGET_FILE:aot_g3_exec_probe>
+                     --fixtures "${AOT_G3_DIR}"
+                     --config "${AOT_G3_CONFIG}")
+    set_tests_properties(aot_g3_exec_oracle PROPERTIES TIMEOUT 300
+                         DEPENDS aot_g3_exec)
+
+    # Negative fixtures: generated descriptors + their own probe.
+    set_source_files_properties("${AOT_G3_DIR}/g3_neg_cases.c"
+        PROPERTIES GENERATED TRUE)
+    add_library(aot_g3_neg_desc STATIC "${AOT_G3_DIR}/g3_neg_cases.c")
+    target_include_directories(aot_g3_neg_desc PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot" "${CMAKE_SOURCE_DIR}/tests/aot")
+    target_compile_options(aot_g3_neg_desc PRIVATE /W4 /WX)
+    add_dependencies(aot_g3_neg_desc aot_g3_fixtures)
+
+    add_executable(aot_g3_neg_probe tests/aot/aot_g3_neg_probe.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_as.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_mem.c)
+    target_include_directories(aot_g3_neg_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot" "${CMAKE_SOURCE_DIR}/tests/aot")
+    target_compile_options(aot_g3_neg_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_neg_probe PRIVATE host_vm aot_g3_loader
+        aot_g3_neg_desc)
+    add_dependencies(aot_g3_neg_probe aot_g3_fixtures)
+
+    # T4 loader mutants: the same probes over a loader compiled with ONE
+    # deliberately wrong rule (MN_AOT_MUTANT_* in src/aot/aot_loader.c). Each
+    # executable must be rejected by the probe with the specific failure the
+    # driver expects; a surviving mutant means that check is vacuous.
+    set(AOT_LOADER_MUTANTS
+        RELATIVE_NO_BASE ABS64_NO_ADDEND JUMPSLOT_ADDEND_ACCEPT GLOBAL_FIRST
+        OBSERVER_ALL_KINDS WEAK_STRONG_SWAP TRUNC32 THUNK_PER_MODULE
+        NO_DUP_CHECK SYMBOL_FIRST_ANY)
+    set(AOT_LOADER_SRC_ALL
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_loader.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_sha256.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_as.c
+        ${CMAKE_SOURCE_DIR}/src/aot/aot_mem.c)
+    foreach(mut ${AOT_LOADER_MUTANTS})
+        add_executable(aot_g3_link_mut_${mut}
+            tests/aot/aot_g3_link_probe.c ${AOT_LOADER_SRC_ALL})
+        target_include_directories(aot_g3_link_mut_${mut} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_g3_link_mut_${mut} PRIVATE /W4 /WX)
+        target_compile_definitions(aot_g3_link_mut_${mut}
+            PRIVATE MN_AOT_MUTANT_${mut})
+        target_link_libraries(aot_g3_link_mut_${mut} PRIVATE host_vm
+            aot_g3_desc_v0 aot_g3_desc_relr aot_g3_desc_gnuonly aot_g3_desc_shadow
+            aot_g3_blocks_v0)
+        add_dependencies(aot_g3_link_mut_${mut} aot_g3_fixtures)
+    endforeach()
+    # Only these are detected by the negative-fixture probe (the link probe
+    # cannot see them: a good image never has a non-zero JUMP_SLOT addend, never
+    # writes a site twice, and never relocates a site into a consumed table).
+    set(AOT_LOADER_NEG_MUTANTS JUMPSLOT_ADDEND_ACCEPT NO_DUP_CHECK
+        ALLOW_TABLE_OVERLAP)
+    foreach(mut ${AOT_LOADER_NEG_MUTANTS})
+        add_executable(aot_g3_neg_mut_${mut}
+            tests/aot/aot_g3_neg_probe.c ${AOT_LOADER_SRC_ALL})
+        target_include_directories(aot_g3_neg_mut_${mut} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot" "${CMAKE_SOURCE_DIR}/tests/aot")
+        target_compile_options(aot_g3_neg_mut_${mut} PRIVATE /W4 /WX)
+        target_compile_definitions(aot_g3_neg_mut_${mut}
+            PRIVATE MN_AOT_MUTANT_${mut})
+        target_link_libraries(aot_g3_neg_mut_${mut} PRIVATE host_vm
+            aot_g3_neg_desc)
+        add_dependencies(aot_g3_neg_mut_${mut} aot_g3_fixtures)
+    endforeach()
+
+    add_test(NAME aot_g3_loader_mutants
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tools/aot/g3_loader_mutant_test.py"
+                --exedir "$<TARGET_FILE_DIR:aot_g3_link_probe>"
+                --dir "${AOT_G3_DIR}")
+    set_tests_properties(aot_g3_loader_mutants PROPERTIES TIMEOUT 600
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # Driver: runs the probe per variant, diffs the C dump against the
+    # reference TSV, re-runs the independent llvm-readelf checker against the
+    # C dump, and compares the C counters with the reference counters. Missing
+    # files, crashes and timeouts are failures, never skips.
+    add_test(NAME aot_g3_link
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/g3_link_test.py"
+                --dir "${AOT_G3_DIR}"
+                --probe "$<TARGET_FILE:aot_g3_link_probe>"
+                --check "${AOT_G3_CHECK}"
+                --python "${AOT_PYTHON}"
+                --config "${AOT_G3_CONFIG}"
+                --readelf "${AOT_LLVM_READELF}")
+    set_tests_properties(aot_g3_link PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    add_test(NAME aot_g3_neg
+        COMMAND aot_g3_neg_probe "${AOT_G3_DIR}/neg")
+    set_tests_properties(aot_g3_neg PROPERTIES TIMEOUT 300)
+
+    # Negative control for the review-fix-11 detail comparison: comparing each
+    # case against ANOTHER case's declared detail MUST fail.
+    add_test(NAME aot_g3_neg_details_control
+        COMMAND aot_g3_neg_probe "${AOT_G3_DIR}/neg" --drift-details)
+    set_tests_properties(aot_g3_neg_details_control PROPERTIES TIMEOUT 300)
+
+    # Independent check: llvm-readelf-derived expected sites/digest must agree
+    # with the reference linker for every variant.
+    add_test(NAME aot_g3_link_reference
+        COMMAND "${AOT_PYTHON}" "${AOT_G3_CHECK}"
+                --dir "${AOT_G3_DIR}" --config "${AOT_G3_CONFIG}"
+                --readelf "${AOT_LLVM_READELF}")
+    set_tests_properties(aot_g3_link_reference PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # G2 generated-code identity guard (G3 increment 3): every G2 translation
+    # unit must stay byte-identical to the committed baseline apart from the
+    # two provenance-derived lines (the translator self-fingerprint).
+    add_test(NAME aot_g2_gen_identity
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tools/aot/g2_gen_identity_check.py"
+                --dir "${AOT_GEN_DIR}"
+                --baseline "${CMAKE_SOURCE_DIR}/tests/aot/g2_gen_identity.txt")
+    set_tests_properties(aot_g2_gen_identity PROPERTIES TIMEOUT 120
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # Typed-error paths of the offline toolchain + a negative control proving
+    # the identity guard rejects a semantic change.
+    add_test(NAME aot_g3_error_paths
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tools/aot/g3_error_paths_test.py"
+                --g3-dir "${AOT_G3_DIR}"
+                --aot-gen "${AOT_GEN_DIR}"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot"
+                --python "${AOT_PYTHON}"
+                --config "${CMAKE_SOURCE_DIR}/tests/aot/g3/link_config.json"
+                --readelf "${AOT_LLVM_READELF}"
+                --baseline "${CMAKE_SOURCE_DIR}/tests/aot/g2_gen_identity.txt")
+    set_tests_properties(aot_g3_error_paths PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    add_test(NAME aot_g3_runtime_mutants
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tools/aot/g3_mutant_test.py"
+                --exedir "$<TARGET_FILE_DIR:aot_as_probe>")
+    set_tests_properties(aot_g3_runtime_mutants PROPERTIES TIMEOUT 900
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # G3 increment 4, work item A: the Mac observer/override tables are derived
+    # from THIS repository's sources, so this test needs no game data and is
+    # always registered. It pins the derivation result (6 observers, 171
+    # overrides) and the documented configuration sensitivity (rumble/gyro/
+    # libvpx switches change the tables in a known direction).
+    add_test(NAME aot_g3_mac_bindings
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_mac_bindings_test.py"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot")
+    set_tests_properties(aot_g3_mac_bindings PROPERTIES TIMEOUT 120
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # G3 increment 4, work items B/C: real TotK 1.0.0 modules. LOCAL ONLY and
+    # opt-in: when MN_TOTK_V0_DIR is unset, neither of these is registered (a
+    # real-module test is never silently skipped). The directory must hold the
+    # flats produced by `aot_module.py nso2flat` (flat/), the Mac bindings
+    # (bindings-mac.json) and the generated descriptors (link/real_desc.c).
+    set(MN_TOTK_V0_DIR "" CACHE PATH
+        "Local TotK v1.0.0 work dir (flat/, bindings-mac.json, link/) -- enables real-module tests")
+    if(MN_TOTK_V0_DIR)
+        if(NOT EXISTS "${MN_TOTK_V0_DIR}/link/real_desc.c")
+            message(FATAL_ERROR
+                "MN_TOTK_V0_DIR=${MN_TOTK_V0_DIR} but link/real_desc.c is "
+                "missing: run tools/aot/aot_module.py emit-desc for the real "
+                "link set first (see docs/g3-module-loader.md).")
+        endif()
+        foreach(img real_main real_sdk)
+            if(NOT EXISTS "${MN_TOTK_V0_DIR}/img/${img}.c")
+                message(FATAL_ERROR
+                    "MN_TOTK_V0_DIR=${MN_TOTK_V0_DIR} but "
+                    "img/${img}.c is missing: run tools/aot/aot_translate.py "
+                    "--module for the real slice first (see "
+                    "docs/g3-module-loader.md).")
+            endif()
+        endforeach()
+        add_library(aot_g3_desc_real STATIC
+            "${MN_TOTK_V0_DIR}/link/real_desc.c")
+        target_include_directories(aot_g3_desc_real PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_g3_desc_real PRIVATE /W4 /WX)
+        # The real descriptor points at these two translated images (main and
+        # sdk); subsdk0 stays link-only (image == NULL).
+        add_library(aot_g3_img_real STATIC
+            "${MN_TOTK_V0_DIR}/img/real_main.c"
+            "${MN_TOTK_V0_DIR}/img/real_sdk.c")
+        target_include_directories(aot_g3_img_real PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_g3_img_real PRIVATE /W4 /WX)
+
+        add_executable(aot_g3_real_link_probe
+            tests/aot/aot_g3_real_link_probe.c
+            ${CMAKE_SOURCE_DIR}/src/aot/aot_as.c
+            ${CMAKE_SOURCE_DIR}/src/aot/aot_mem.c)
+        target_include_directories(aot_g3_real_link_probe PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_g3_real_link_probe PRIVATE /W4 /WX)
+        target_link_libraries(aot_g3_real_link_probe PRIVATE host_vm
+            aot_g3_loader aot_g3_desc_real aot_g3_img_real)
+
+        add_test(NAME aot_g3_real_link
+            COMMAND "${AOT_PYTHON}"
+                    "${CMAKE_SOURCE_DIR}/tests/aot/aot_real_link_test.py"
+                    --probe "$<TARGET_FILE:aot_g3_real_link_probe>"
+                    --python "${AOT_PYTHON}"
+                    --v0-dir "${MN_TOTK_V0_DIR}"
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/aot_gen/real")
+        set_tests_properties(aot_g3_real_link PROPERTIES TIMEOUT 900
+            ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+        # ---- Item D: execute the translated real slice ------------------
+        add_executable(aot_g3_real_exec_probe
+            tests/aot/aot_g3_real_exec_probe.c
+            ${CMAKE_SOURCE_DIR}/src/aot/aot_prog_assembly.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_g3_real_exec_probe PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_g3_real_exec_probe PRIVATE /W4 /WX)
+        target_link_libraries(aot_g3_real_exec_probe PRIVATE host_vm
+            host_thread host_time aot_g3_loader aot_g3_desc_real
+            aot_g3_img_real)
+        add_test(NAME aot_g3_real_exec
+            COMMAND aot_g3_real_exec_probe "${MN_TOTK_V0_DIR}/link")
+        set_tests_properties(aot_g3_real_exec PROPERTIES TIMEOUT 900)
+        # Negative control: the same main image at a wrong guest base must be
+        # refused by build_program before any guest instruction runs.
+        add_test(NAME aot_g3_real_exec_neg
+            COMMAND aot_g3_real_exec_probe "${MN_TOTK_V0_DIR}/link"
+                    --wrong-base)
+        set_tests_properties(aot_g3_real_exec_neg PROPERTIES TIMEOUT 900)
+    endif()
 endif()

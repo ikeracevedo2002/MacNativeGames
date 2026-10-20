@@ -60,16 +60,35 @@ typedef struct AotMemDomain AotMemDomain;
 
 typedef enum {
     AOT_MEM_OK = 0,
-    AOT_MEM_ERR_RANGE,   /* access outside [base, base+size) */
+    AOT_MEM_ERR_RANGE,   /* access outside every mapped range */
     AOT_MEM_ERR_ALIGN,   /* caller demanded alignment and it was violated */
-    AOT_MEM_ERR_WIDTH    /* unsupported access width */
+    AOT_MEM_ERR_WIDTH,   /* unsupported access width or invalid permission */
+    /* The address is mapped but the page permission forbids the access
+     * (a Program-mode guest address space only; the G2 arena never returns
+     * it). Appended so every previous value is unchanged. */
+    AOT_MEM_ERR_PERM
 } AotMemStatus;
 
+typedef struct AotAddressSpace AotAddressSpace;
+
+/* A guest memory handle. Two mutually exclusive modes:
+ *
+ *   - G2 arena mode (`as == NULL`): one contiguous host allocation described
+ *     by base/size/guest_base. Every G2 generated image uses this mode and its
+ *     behaviour is UNCHANGED.
+ *   - Program mode (`as != NULL`): the guest address space owns a sealed table
+ *     of page-permission-checked regions (src/aot/aot_as.h). base/size/
+ *     guest_base are then unused (0/NULL) and every access resolves through
+ *     the address space.
+ *
+ * Both modes serialize every access under the SAME domain-wide lock, so the
+ * proof's memory model stays sequentially consistent across modes. */
 typedef struct AotMem {
     uint8_t *base;        /* host allocation (NULL => invalid arena) */
     uint64_t size;        /* bytes (> 0) */
     uint64_t guest_base;  /* guest address of base (evidence only) */
     AotMemDomain *domain; /* shared access domain; explicit lifetime */
+    AotAddressSpace *as;  /* optional Program-mode address space */
 } AotMem;
 
 #define AOT_MEM_MAX_MONITORS 64u
@@ -97,7 +116,25 @@ void aot_mem_domain_invalidate_all(AotMemDomain *d);
 AotMemStatus aot_mem_init(AotMem *m, AotMemDomain *domain, uint8_t *base,
                           uint64_t size, uint64_t guest_base);
 
-/* Bounds check only (no lock). */
+/* Initialize a Program-mode handle over a sealed-or-building address space.
+ * The domain is taken from the address space (aot_as_domain). base/size/
+ * guest_base are zero. Returns AOT_MEM_ERR_RANGE for NULL arguments. */
+AotMemStatus aot_mem_init_aspace(AotMem *m, AotAddressSpace *as);
+
+/* INTERNAL (Program mode): serialize an address-space operation with every
+ * arena access in the same domain. The caller must NOT hold this lock while
+ * running an HLE handler or a nested guest call, and must not re-enter any
+ * other aot_mem_ / aot_as_ entry point that takes the lock. */
+void aot_mem_domain_lock(AotMemDomain *d);
+void aot_mem_domain_unlock(AotMemDomain *d);
+
+/* Bounds check only (no PERMISSION check). Arena mode: registered-arena
+ * bounds, taken WITHOUT the domain lock (documented quiescent-use
+ * precondition). Program mode: the address space's domain lock IS taken and the
+ * range must lie inside one mapped region; page permissions are checked by the
+ * access functions (or aot_as_check_locked) instead. The handle itself is
+ * always validated: an AotMem whose m->domain is not aot_as_domain(m->as) fails
+ * closed with AOT_MEM_ERR_RANGE. */
 AotMemStatus aot_mem_check(const AotMem *m, uint64_t addr, uint64_t n);
 
 /* Alignment predicate. */

@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "aot_as.h"
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -113,6 +115,20 @@ void aot_mem_domain_invalidate_all(AotMemDomain *d) {
     ReleaseSRWLockExclusive(&d->lock);
 }
 
+/* Program-mode serialization: the address space shares this domain lock with
+ * every arena access, so one lock still defines the whole memory model (D013).
+ * NULL is tolerated so a handle constructed without a domain fails closed with
+ * a range error instead of dereferencing NULL. */
+void aot_mem_domain_lock(AotMemDomain *d) {
+    if (d == NULL) return;
+    AcquireSRWLockExclusive(&d->lock);
+}
+
+void aot_mem_domain_unlock(AotMemDomain *d) {
+    if (d == NULL) return;
+    ReleaseSRWLockExclusive(&d->lock);
+}
+
 static int mon_find_locked(AotMemDomain *d, uint32_t token) {
     for (size_t i = 0; i < AOT_MEM_MAX_MONITORS; i++) {
         if (d->mon[i].active && d->mon[i].token == token) return (int)i;
@@ -168,6 +184,7 @@ AotMemStatus aot_mem_init(AotMem *m, AotMemDomain *domain, uint8_t *base,
     m->size = 0;
     m->guest_base = 0;
     m->domain = NULL;
+    m->as = NULL;
     if (domain == NULL || base == NULL || size == 0u)
         return AOT_MEM_ERR_RANGE;
     if (guest_base > UINT64_MAX - size) return AOT_MEM_ERR_RANGE;
@@ -215,6 +232,20 @@ AotMemStatus aot_mem_init(AotMem *m, AotMemDomain *domain, uint8_t *base,
     m->size = size;
     m->guest_base = guest_base;
     m->domain = domain;
+    m->as = NULL;
+    return AOT_MEM_OK;
+}
+
+AotMemStatus aot_mem_init_aspace(AotMem *m, AotAddressSpace *as) {
+    if (m == NULL) return AOT_MEM_ERR_RANGE;
+    m->base = NULL;
+    m->size = 0;
+    m->guest_base = 0;
+    m->domain = NULL;
+    m->as = NULL;
+    if (as == NULL || aot_as_domain(as) == NULL) return AOT_MEM_ERR_RANGE;
+    m->domain = aot_as_domain(as);
+    m->as = as;
     return AOT_MEM_OK;
 }
 
@@ -223,7 +254,23 @@ int aot_mem_is_aligned(uint64_t addr, uint64_t align) {
     return (addr & (align - 1u)) == 0u;
 }
 
-AotMemStatus aot_mem_check(const AotMem *m, uint64_t addr, uint64_t n) {
+/* Handle identity for every locked entry point. In AS (Program) mode all
+ * serialization and permission bookkeeping is keyed on the address space's own
+ * domain: m->domain is the lock that is taken and the identity the monitor
+ * table is looked up in, while the page table belongs to m->as. If a copied or
+ * forged AotMem made those diverge, the access would take a lock that does not
+ * order against the address space and would read the page table without that
+ * ordering, so the pair is verified on every call and fails closed
+ * (AOT_MEM_ERR_RANGE) instead of running unserialized. */
+static int mem_handle_ok(const AotMem *m) {
+    if (m == NULL || m->domain == NULL) return 0;
+    if (m->as != NULL && aot_as_domain(m->as) != m->domain) return 0;
+    return 1;
+}
+
+/* Arena bounds check. Called with the domain lock held (or during
+ * init/quiescent public use, as documented). */
+static AotMemStatus arena_check(const AotMem *m, uint64_t addr, uint64_t n) {
     if (m == NULL || m->base == NULL || m->domain == NULL)
         return AOT_MEM_ERR_RANGE;
     /* The domain, not the copied AotMem value, owns the arena identity. */
@@ -234,6 +281,43 @@ AotMemStatus aot_mem_check(const AotMem *m, uint64_t addr, uint64_t n) {
     if (off > m->size) return AOT_MEM_ERR_RANGE;
     if (n > m->size - off) return AOT_MEM_ERR_RANGE;
     return AOT_MEM_OK;
+}
+
+/* Does [addr, addr+n) resolve to guest memory this handle may address? NOT a
+ * permission check: in AS mode it only proves the range is fully inside one
+ * mapped region (taken under the address space's domain lock); in arena mode
+ * it is the registered-arena bounds check, taken WITHOUT the lock per the
+ * documented quiescent-use precondition. Callers that need R/W enforcement use
+ * the ld/st helpers (or aot_as_check_locked for an explicit probe). */
+AotMemStatus aot_mem_check(const AotMem *m, uint64_t addr, uint64_t n) {
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
+    if (m->as != NULL) {
+        AotMemStatus s;
+        aot_mem_domain_lock(m->domain);
+        s = aot_as_range_locked(m->as, addr, n);
+        aot_mem_domain_unlock(m->domain);
+        return s;
+    }
+    return arena_check(m, addr, n);
+}
+
+/* Permission/bounds pre-check performed under the domain lock BEFORE any
+ * reservation invalidation or byte write. In Program mode this is the page
+ * table check that makes a faulting store leave memory untouched. */
+static AotMemStatus mem_precheck_locked(const AotMem *m, uint64_t addr,
+                                        uint64_t n, int for_write) {
+    if (m->as != NULL) {
+        if (!for_write) return aot_as_check_locked(m->as, addr, n, 0);
+#ifdef MN_AOT_MUTANT_PARTIAL_STORE
+        /* TEST-ONLY wrong-implementation control: the write permission is left
+         * to the per-page check inside the copy, which is exactly how a
+         * partial store is produced. Read checks are unchanged. */
+        return aot_as_range_locked(m->as, addr, n);
+#else
+        return aot_as_check_locked(m->as, addr, n, 1);
+#endif
+    }
+    return arena_check(m, addr, n);
 }
 
 static uint16_t le16(const uint8_t *p) {
@@ -261,10 +345,13 @@ static void st64(uint8_t *p, uint64_t v) {
     st32(p + 4, (uint32_t)((v >> 32) & 0xffffffffu));
 }
 
-/* Unlocked little-endian access helpers (domain lock already held). */
+/* Unlocked little-endian access helpers (domain lock already held). In
+ * Program mode they resolve through the address space instead of the single
+ * arena; the G2 path is unchanged. */
 static AotMemStatus ld_le(const AotMem *m, uint64_t addr, unsigned w,
                           uint64_t *out) {
-    AotMemStatus s = aot_mem_check(m, addr, w);
+    if (m->as != NULL) return aot_as_ld_locked(m->as, addr, w, out);
+    AotMemStatus s = arena_check(m, addr, w);
     if (s != AOT_MEM_OK) return s;
     const uint8_t *p = m->base + (addr - m->guest_base);
     switch (w) {
@@ -277,7 +364,8 @@ static AotMemStatus ld_le(const AotMem *m, uint64_t addr, unsigned w,
     return AOT_MEM_OK;
 }
 static AotMemStatus st_le(AotMem *m, uint64_t addr, unsigned w, uint64_t v) {
-    AotMemStatus s = aot_mem_check(m, addr, w);
+    if (m->as != NULL) return aot_as_st_locked(m->as, addr, w, v);
+    AotMemStatus s = arena_check(m, addr, w);
     if (s != AOT_MEM_OK) return s;
     uint8_t *p = m->base + (addr - m->guest_base);
     switch (w) {
@@ -293,7 +381,7 @@ static AotMemStatus st_le(AotMem *m, uint64_t addr, unsigned w, uint64_t v) {
 AotMemStatus aot_mem_ld8(const AotMem *m, uint64_t addr, uint8_t *out) {
     uint64_t v = 0;
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
     s = ld_le(m, addr, 1, &v);
     ReleaseSRWLockExclusive(&m->domain->lock);
@@ -303,7 +391,7 @@ AotMemStatus aot_mem_ld8(const AotMem *m, uint64_t addr, uint8_t *out) {
 AotMemStatus aot_mem_ld16(const AotMem *m, uint64_t addr, uint16_t *out) {
     uint64_t v = 0;
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
     s = ld_le(m, addr, 2, &v);
     ReleaseSRWLockExclusive(&m->domain->lock);
@@ -313,7 +401,7 @@ AotMemStatus aot_mem_ld16(const AotMem *m, uint64_t addr, uint16_t *out) {
 AotMemStatus aot_mem_ld32(const AotMem *m, uint64_t addr, uint32_t *out) {
     uint64_t v = 0;
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
     s = ld_le(m, addr, 4, &v);
     ReleaseSRWLockExclusive(&m->domain->lock);
@@ -323,7 +411,7 @@ AotMemStatus aot_mem_ld32(const AotMem *m, uint64_t addr, uint32_t *out) {
 AotMemStatus aot_mem_ld64(const AotMem *m, uint64_t addr, uint64_t *out) {
     uint64_t v = 0;
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
     s = ld_le(m, addr, 8, &v);
     ReleaseSRWLockExclusive(&m->domain->lock);
@@ -333,11 +421,11 @@ AotMemStatus aot_mem_ld64(const AotMem *m, uint64_t addr, uint64_t *out) {
 AotMemStatus aot_mem_ld128(const AotMem *m, uint64_t addr, uint64_t out[2]) {
     uint64_t a = 0, b = 0;
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
     /* Check the WHOLE 16-byte range first: a partially in-range pair must not
      * read (or report) half the value. */
-    s = aot_mem_check(m, addr, 16);
+    s = mem_precheck_locked(m, addr, 16, 0);
     if (s == AOT_MEM_OK) s = ld_le(m, addr, 8, &a);
     if (s == AOT_MEM_OK) s = ld_le(m, addr + 8u, 8, &b);
     ReleaseSRWLockExclusive(&m->domain->lock);
@@ -347,9 +435,9 @@ AotMemStatus aot_mem_ld128(const AotMem *m, uint64_t addr, uint64_t out[2]) {
 
 AotMemStatus aot_mem_st8(AotMem *m, uint64_t addr, uint8_t v) {
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
-    s = aot_mem_check(m, addr, 1);
+    s = mem_precheck_locked(m, addr, 1, 1);
     if (s == AOT_MEM_OK) {
         mon_invalidate_locked(m->domain, addr, 1);
         s = st_le(m, addr, 1, v);
@@ -359,9 +447,9 @@ AotMemStatus aot_mem_st8(AotMem *m, uint64_t addr, uint8_t v) {
 }
 AotMemStatus aot_mem_st16(AotMem *m, uint64_t addr, uint16_t v) {
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
-    s = aot_mem_check(m, addr, 2);
+    s = mem_precheck_locked(m, addr, 2, 1);
     if (s == AOT_MEM_OK) {
         mon_invalidate_locked(m->domain, addr, 2);
         s = st_le(m, addr, 2, v);
@@ -371,9 +459,9 @@ AotMemStatus aot_mem_st16(AotMem *m, uint64_t addr, uint16_t v) {
 }
 AotMemStatus aot_mem_st32(AotMem *m, uint64_t addr, uint32_t v) {
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
-    s = aot_mem_check(m, addr, 4);
+    s = mem_precheck_locked(m, addr, 4, 1);
     if (s == AOT_MEM_OK) {
         mon_invalidate_locked(m->domain, addr, 4);
         s = st_le(m, addr, 4, v);
@@ -383,9 +471,9 @@ AotMemStatus aot_mem_st32(AotMem *m, uint64_t addr, uint32_t v) {
 }
 AotMemStatus aot_mem_st64(AotMem *m, uint64_t addr, uint64_t v) {
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
-    s = aot_mem_check(m, addr, 8);
+    s = mem_precheck_locked(m, addr, 8, 1);
     if (s == AOT_MEM_OK) {
         mon_invalidate_locked(m->domain, addr, 8);
         s = st_le(m, addr, 8, v);
@@ -395,9 +483,9 @@ AotMemStatus aot_mem_st64(AotMem *m, uint64_t addr, uint64_t v) {
 }
 AotMemStatus aot_mem_st128(AotMem *m, uint64_t addr, const uint64_t v[2]) {
     AotMemStatus s;
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     AcquireSRWLockExclusive(&m->domain->lock);
-    s = aot_mem_check(m, addr, 16);
+    s = mem_precheck_locked(m, addr, 16, 1);
     if (s == AOT_MEM_OK) {
         mon_invalidate_locked(m->domain, addr, 16);
         s = st_le(m, addr, 8, v[0]);
@@ -433,7 +521,7 @@ AotMemStatus aot_mem_lds32(const AotMem *m, uint64_t addr, int64_t *out) {
 
 AotMemStatus aot_mem_ldx(AotMem *m, uint32_t token, uint64_t addr,
                          unsigned width, uint64_t *out) {
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     if (width != 1u && width != 2u && width != 4u && width != 8u)
         return AOT_MEM_ERR_WIDTH;
     if (!aot_mem_is_aligned(addr, width)) return AOT_MEM_ERR_ALIGN;
@@ -456,24 +544,26 @@ AotMemStatus aot_mem_ldx(AotMem *m, uint32_t token, uint64_t addr,
 
 AotMemStatus aot_mem_stx(AotMem *m, uint32_t token, uint64_t addr,
                          unsigned width, uint64_t val, uint32_t *status) {
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     if (width != 1u && width != 2u && width != 4u && width != 8u)
         return AOT_MEM_ERR_WIDTH;
     if (!aot_mem_is_aligned(addr, width)) return AOT_MEM_ERR_ALIGN;
     AotMemStatus s;
     uint32_t st = 1u;
     AcquireSRWLockExclusive(&m->domain->lock);
-    s = aot_mem_check(m, addr, width);
-    if (s == AOT_MEM_OK) {
+    s = mem_precheck_locked(m, addr, width, 1);
+    {
         int i = mon_find_locked(m->domain, token);
-        if (i >= 0 && m->domain->mon[i].size == width &&
+        if (s == AOT_MEM_OK && i >= 0 && m->domain->mon[i].size == width &&
             m->domain->mon[i].addr == addr) {
             st = 0u;
             mon_invalidate_locked(m->domain, addr, width);
             s = st_le(m, addr, width, val);
         }
-        /* STXR clears the reservation on success AND failure, but keeps the
-         * runtime's attached monitor token alive. */
+        /* STXR clears the reservation on success AND failure - including a
+         * failure of the permission/bounds pre-check, which must still consume
+         * the local exclusive monitor exactly like the architectural STXR -
+         * but keeps the runtime's attached monitor token alive. */
         if (i >= 0) m->domain->mon[i].size = 0;
     }
     ReleaseSRWLockExclusive(&m->domain->lock);
@@ -483,7 +573,7 @@ AotMemStatus aot_mem_stx(AotMem *m, uint32_t token, uint64_t addr,
 
 AotMemStatus aot_mem_ldar(AotMem *m, uint64_t addr, unsigned width,
                           uint64_t *out) {
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     if (width != 1u && width != 2u && width != 4u && width != 8u)
         return AOT_MEM_ERR_WIDTH;
     if (!aot_mem_is_aligned(addr, width)) return AOT_MEM_ERR_ALIGN;
@@ -498,13 +588,13 @@ AotMemStatus aot_mem_ldar(AotMem *m, uint64_t addr, unsigned width,
 
 AotMemStatus aot_mem_stlr(AotMem *m, uint64_t addr, unsigned width,
                           uint64_t val) {
-    if (m == NULL || m->domain == NULL) return AOT_MEM_ERR_RANGE;
+    if (!mem_handle_ok(m)) return AOT_MEM_ERR_RANGE;
     if (width != 1u && width != 2u && width != 4u && width != 8u)
         return AOT_MEM_ERR_WIDTH;
     if (!aot_mem_is_aligned(addr, width)) return AOT_MEM_ERR_ALIGN;
     AotMemStatus s;
     AcquireSRWLockExclusive(&m->domain->lock);
-    s = aot_mem_check(m, addr, width);
+    s = mem_precheck_locked(m, addr, width, 1);
     if (s == AOT_MEM_OK) {
         mon_invalidate_locked(m->domain, addr, width);
         s = st_le(m, addr, width, val);

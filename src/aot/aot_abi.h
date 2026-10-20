@@ -36,8 +36,19 @@
  * fixtures and the translated-memory concurrency fixtures. v1 was the smaller
  * first-subset id; see DECISIONS.md D012 for the scoped supersession. */
 #define AOT_ABI_VERSION        1u
+/* ABI version of an image intended for the G3 multi-image Program runtime:
+ * thunks are guest functions entered by any transfer and the resume PC is the
+ * guest's own x30, not site_pc + 4. AOT_ABI_VERSION (1) stays the G2
+ * single-image ABI and behaves EXACTLY as before. A Program accepts only v2
+ * images; the legacy G2 runtime accepts only v1 images. */
+#define AOT_ABI_VERSION_PROGRAM 2u
 #define AOT_STATE_LAYOUT       1u
 #define AOT_SUBSET_ID          "g2-core-v2"
+/* Program (ABI v2) images carry their OWN subset id: the multi-module
+ * translator emits it and aot_program_finalize accepts ONLY this value for
+ * ABI-v2 images. The legacy G2 single-image runtime keeps requiring
+ * AOT_SUBSET_ID (they are different instruction subsets, not aliases). */
+#define AOT_SUBSET_ID_MODULE   "g3-module-v1"
 
 #define AOT_GPR_COUNT          31u   /* x0..x30 */
 #define AOT_VREG_COUNT         32u
@@ -128,7 +139,11 @@ enum {
  * resume_pc is always a guest PC, never a host pointer. */
 typedef enum {
     AOT_HLE_SVC      = 1u,
-    AOT_HLE_HOSTCALL = 2u
+    AOT_HLE_HOSTCALL = 2u,
+    /* Program mode only: a guest `mrs Xt, <sysreg>` (AOT_EXIT_SYSREG).
+     * id = AOT_SYSREG_ID(sysreg16, Rt); site_pc = the MRS instruction;
+     * the runtime resumes at site_pc + 4 (the next instruction). */
+    AOT_HLE_SYSREG   = 3u
 } AotHleKind;
 
 typedef struct AotHleRequest {
@@ -159,5 +174,86 @@ typedef struct AotHleRequest {
  * Mac binary gate/frame layout.
  */
 typedef void (*AotHleHandler)(AotGuestState *s, const AotHleRequest *req, void *user);
+
+/* Program-mode handler. It receives the runtime so it may make a NESTED
+ * host->guest call (aot_call_guest) while the outer dispatch loop is suspended.
+ * Everything the AotHleHandler contract says still applies, plus:
+ *   - the runtime owns pc and the resume PC exactly as before;
+ *   - a nested call's fault is STICKY: even if the handler ignores the
+ *     returned fault code, the outer dispatch loop terminates with it. */
+typedef struct AotRuntime AotRuntime;
+typedef void (*AotProgHandler)(AotRuntime *rt, AotGuestState *s,
+                              const AotHleRequest *req, void *user);
+
+/*
+ * System-register IDs (Program mode).
+ *
+ * An A64 MRS instruction encodes <sysreg> in bits 20..5 as the 16-bit field
+ * `1:o0:op1:CRn:CRm:op2` (bit 20 is the constant opcode bit, bit 19 is o0,
+ * op1 is bits 18..16, CRn bits 15..12, CRm bits 11..8, op2 bits 7..5).
+ * The ARCHITECTURAL op0 is 2 + o0, which is why AOT_SYSREG16() takes op0.
+ *
+ * The runtime's HLE id folds that field together with the destination
+ * register: id = (sysreg16 << 8) | Rt, so one handler can serve every
+ * destination register of the same sysreg.
+ */
+#define AOT_SYSREG16(op0, op1, crn, crm, op2)                          \
+    ((uint32_t)(0x8000u | ((((op0) - 2u) & 1u) << 14) |               \
+                (((op1) & 7u) << 11) | (((crn) & 15u) << 7) |          \
+                (((crm) & 15u) << 3) | ((op2) & 7u)))
+#define AOT_SYSREG_ID(sysreg16, rt) \
+    (((uint32_t)(sysreg16) << 8) | ((uint32_t)(rt) & 31u))
+/* Handler-lookup key for an HLE id.
+ *
+ * AOT_HLE_SYSREG ids fold the DESTINATION REGISTER into the low 5 bits, but a
+ * system register has at most ONE handler: handlers are registered with Rt=0
+ * and looked up through this key, so one handler serves every Rt of that
+ * register.  The handler learns the real destination from
+ * AOT_SYSREG_ID_RT(req->id) -- aot_sysreg_write_dest() does exactly that and
+ * writes nothing when Rt == 31, so an `mrs xzr, <sysreg>` still performs the
+ * architectural read and still calls the handler exactly once.
+ *
+ * Every other HLE kind keys on the full id: SVC ids are the imm16 and
+ * AOT_HLE_HOSTCALL ids are thunk indices, neither of which carries a register
+ * number, so masking them would silently alias unrelated handlers. */
+static inline uint32_t aot_hle_id_key(uint32_t kind, uint32_t id)
+{
+    return (kind == (uint32_t)AOT_HLE_SYSREG) ? (id & ~31u) : id;
+}
+#define AOT_SYSREG_ID_FIELD(id) ((uint32_t)((id) >> 8) & 0xffffu)
+#define AOT_SYSREG_ID_RT(id)    ((uint32_t)(id) & 31u)
+
+/* CNTPCT_EL0: op0=3, op1=3, CRn=14, CRm=0, op2=1 -> 0xDF01.
+ * CNTVCT_EL0: same but op2=2 -> 0xDF02. */
+#define AOT_SYSREG_CNTPCT_EL0 AOT_SYSREG16(3u, 3u, 14u, 0u, 1u)
+#define AOT_SYSREG_CNTVCT_EL0 AOT_SYSREG16(3u, 3u, 14u, 0u, 2u)
+/* TPIDR_EL0 (op2=2) / TPIDRRO_EL0 (op2=3): translated INLINE from the guest
+ * state (no HLE request), so these exist for fixture/probe clarity. */
+#define AOT_SYSREG_TPIDR_EL0   AOT_SYSREG16(3u, 3u, 13u, 0u, 2u)
+#define AOT_SYSREG_TPIDRRO_EL0 AOT_SYSREG16(3u, 3u, 13u, 0u, 3u)
+
+_Static_assert(AOT_SYSREG_CNTPCT_EL0 == 0xDF01u, "SYSREG: CNTPCT_EL0 field");
+_Static_assert(AOT_SYSREG_CNTVCT_EL0 == 0xDF02u, "SYSREG: CNTVCT_EL0 field");
+_Static_assert(AOT_SYSREG_ID_RT(AOT_SYSREG_ID(AOT_SYSREG_CNTPCT_EL0, 31u)) == 31u,
+               "SYSREG: id carries Rt");
+
+/* Deliver a SYSREG handler result to the guest destination encoded in
+ * req->id. Rt == 31 is XZR: the value is DISCARDED (there is no x31 slot in
+ * AotGuestState, and a discarded write must not disturb any other register).
+ * Handlers must use this helper (or the same rule) for MRS results. */
+static inline void aot_sysreg_write_dest(AotGuestState *s,
+                                        const AotHleRequest *req,
+                                        uint64_t value) {
+    uint32_t rt;
+    if (s == NULL || req == NULL) return;
+    rt = AOT_SYSREG_ID_RT(req->id);
+#ifdef MN_AOT_MUTANT_SYSREG_XZR
+    /* TEST-ONLY wrong-implementation control: an Rt=31 (XZR) write is not
+     * discarded; it is redirected into x0, which guest code can observe. */
+    s->x[(rt < AOT_GPR_COUNT) ? rt : 0u] = value;
+#else
+    if (rt < AOT_GPR_COUNT) s->x[rt] = value;
+#endif
+}
 
 #endif /* AOT_ABI_H */

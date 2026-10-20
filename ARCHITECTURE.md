@@ -109,6 +109,25 @@ remain **NOT STARTED**; real game boot belongs to later G4/G6 gates and has
 not begun. The validated proof was integrated into `windows-x86-port` in
 `8793f189` after explicit user approval. Nothing was pushed.
 
+**G3 module loader/linking status (D014-D017, `docs/g3-module-loader.md`):**
+translated modules run inside an explicit guest address space (guest VAs in
+[2^32, 2^39), never host pointers; Horizon page permissions; guest text is
+host read-only, never executable). A linked Program dispatches every next PC
+across module images, host thunks and per-depth host-return sentinels; a host
+thunk behaves as a guest function (resume at the caller's x30), which is what
+real NSO PLT stubs (`br x17`) require; host code may call guest functions
+synchronously, nested inside HLE handlers, with AAPCS64 verification. The
+loader verifies each flat NSO image (SHA-256 + pinned layout) before mapping,
+relocates RELA/JMPREL/RELR with the Mac resolution order and HLE
+override/observer thunks, and compares a link digest with an independent
+reference linker. Validated on ld.lld-built fixture modules (translated and
+executed, with a Unicorn oracle and mutants) and, locally and opt-in, on the
+real TotK 1.0.0 main/subsdk0/sdk (558,865 relocation sites byte-identical to
+the reference; a translated real slice runs main's PLT stub -> sdk
+`GetSystemTick` -> CNTPCT HLE). **G3 is OPEN**: full-module translation of the
+real modules (D008) is not started; today 37.5% of the real exported
+functions are CFG-complete in the module-mode decoder.
+
 ### Memory model
 
 The Mac implementation assumes relationships between guest virtual addresses, CPU pointers and GPU addresses.
@@ -195,8 +214,8 @@ implementation so far, and only as narrow, game-data-free primitives:
   reserve/commit/decommit/protect/query/flush primitive behind an owning
   handle. It is the host shape of the Mac loader's
   `mmap(NULL, size, PROT_RW, MAP_PRIVATE|MAP_ANON) + fread`, not a guest
-  address strategy; file/COW/alias mapping and fixed guest VA layout are
-  still open (G3).
+  address strategy; file/COW/alias mapping is still open, and the fixed
+  guest VA layout is now provided by the G3 guest address space (D014).
 - **Threads**: `src/host_thread.{h,c}` (host `_beginthreadex` lifecycle) and
   `src/host_sync.{h,c}` (SRWLOCK + CONDITION_VARIABLE) implement HOST
   threads and the host mutex/condition pair only. The guest thread ABI,

@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "G3 increment 2 fixture link configuration: the AOT-time facts that are",
+    "NOT in the module images. Module order is the loader's global symbol",
+    "search order (main, subsdk0, sdk in the real game). guest_base values",
+    "are the fixed AOT-time bases inside [2^32, 2^39). thunk_base + 16*index",
+    "is the guest VA of the host thunk for a symbol name; overrides apply to",
+    "every relocation kind, observers only to JUMP_SLOT."
+  ],
+  "thunk_base": "0x7f00000000",
+  "sentinel": "0x7f00100000",
+  "modules": [
+    {
+      "name": "fx_main",
+      "guest_base": "0x1000000000"
+    },
+    {
+      "name": "fx_sub",
+      "guest_base": "0x1001000000"
+    },
+    {
+      "name": "fx_sdk",
+      "guest_base": "0x1002000000"
+    }
+  ],
+  "overrides": {
+    "host_hook": 0,
+    "host_invoke": 2,
+    "fx_loader_ready": 3,
+    "fx_module_inits": 4,
+    "fx_module_finis": 5
+  },
+  "observers": {
+    "nnMain": 1
+  }
+}

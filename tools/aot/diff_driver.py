@@ -827,13 +827,17 @@ def main():
 
     exact = fault_cases = mismatch = 0
     failures = []
+    # Unique scratch names per process: even if another test (or a stale
+    # run) touches this directory, this run can never collide with its files.
+    scratch = "d%d" % os.getpid()
     for idx, case in enumerate(cases):
-        in_path = os.path.join(args.work, "in_%d.bin" % idx)
-        out_path = os.path.join(args.work, "out_%d.bin" % idx)
+        in_path = os.path.join(args.work, "%s_in_%d.bin" % (scratch, idx))
+        out_path = os.path.join(args.work, "%s_out_%d.bin" % (scratch, idx))
         try:
             nat = native_run(args.exe, case, in_path, out_path)
         except Exception as e:
-            failures.append("%s: native infra: %r" % (case["name"], e))
+            failures.append("%s: native infra: %r (work=%s)"
+                            % (case["name"], e, in_path))
             mismatch += 1
             continue
         try:

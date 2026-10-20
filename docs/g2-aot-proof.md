@@ -9,7 +9,7 @@ recorded **CLOSED / VALIDATED for the controlled proof**. This is **not**
 full-ISA parity, not title/game parity and not backend parity: the global
 translated-code backend choice (D008) stays **OPEN**, the graphics backend
 choice (D007) stays **OPEN**, and G3 (module loader/linking; the runtime
-fault/exception policy is a separate prerequisite) has **NOT STARTED**, with
+fault/exception policy is a separate prerequisite) had **NOT STARTED** at G2 integration (G3 status: `docs/g3-module-loader.md`), with
 real game boot later still (G4/G6, none begun). The validated proof was
 **integrated into `windows-x86-port` in `8793f189` after explicit user approval**.
 The integration tool verified a byte-identical tree to the validated worktree.

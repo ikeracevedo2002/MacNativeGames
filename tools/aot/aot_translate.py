@@ -41,12 +41,44 @@ AOT_ABI_VERSION = 1
 AOT_STATE_LAYOUT = 1
 TOOL_CONFIG = "aot-translate-stage3/cfg-manifest/c-basicblock/v1"
 
+# G3 module mode (--module): one image per loaded module. The image carries
+# the Program ABI version, its own subset id (a Program accepts only this id)
+# and the module flat SHA-256 as its source identity, so the loader binds an
+# image to exactly one module descriptor.
+AOT_MODULE_SUBSET_ID = "g3-module-v1"
+AOT_ABI_VERSION_PROGRAM = 2
+TOOL_CONFIG_MODULE = "aot-translate-stage3/module-flat/c-basicblock/g3-module-v1"
+
+# MRS sysreg16 fields accepted in module mode (see src/aot/aot_abi.h).
+SYSREG_CNTPCT_EL0 = 0xDF01
+SYSREG_CNTVCT_EL0 = 0xDF02
+SYSREG_TPIDR_EL0 = 0xDE82
+SYSREG_TPIDRRO_EL0 = 0xDE83
+SYSREG_COUNTERS = (SYSREG_CNTPCT_EL0, SYSREG_CNTVCT_EL0)
+SYSREG_TPIDR = {SYSREG_TPIDR_EL0: "tpidr", SYSREG_TPIDRRO_EL0: "tpidrro"}
+
 # Test-only negative-control selector. None == the real (unmutated) image.
 MUTANT = None
 MUTANTS = ("wrongcarry", "lostwzeroext", "wrongcond", "blrorder",
            "strdrop", "scalarupper", "pair32trunc",
            "fpdropflags", "stxalwaysok",
-           "fproundrn", "fpnanorder", "fpignoreguard")
+           "fproundrn", "fpnanorder", "fpignoreguard",
+           # G3 increment 3 MODULE-mode-only negative controls.
+           "adrp_offset", "orr_noshift", "stp_split")
+# The two G3 module-mode mutants are only legal with --module; every other
+# mutant belongs to the G2 single-image path and must stay there.
+MODULE_MUTANTS = ("adrp_offset", "orr_noshift", "stp_split")
+MODULE_BASE = 0
+# 1 while translating with --module (ABI-v2 Program image). Module-only
+# lowerings (single-access pair stores) are gated on it so the G2 single-image
+# output stays byte-identical.
+MODULE_MODE = 0
+
+# Guest address-space rules the loader enforces (src/aot/aot_as.h): 4 KiB
+# pages and the guest window [2^32, 2^39).
+AOT_AS_PAGE_BYTES = 0x1000
+AOT_AS_MIN_ADDR = 1 << 32
+AOT_AS_MAX_ADDR = 1 << 39
 
 # NZCV helpers are emitted by name; each marks itself used.
 _HELPERS = {}
@@ -247,9 +279,15 @@ class DecodeError(Exception):
     pass
 
 
-def decode(pc, word):
+def decode(pc, word, module=False):
     """Decode one supported instruction. Returns a dict or raises
-    DecodeError. Every branch is field-validated; unsupported forms fail."""
+    DecodeError. Every branch is field-validated; unsupported forms fail.
+
+    `module` (G3 module mode) enables the extra forms that real linked module
+    text needs (PC-relative ADRP/ADR computed from the ABSOLUTE guest PC,
+    logical shifted register, NOP, MRS of the four supported system
+    registers). The legacy G2 subset is unchanged and its generated C output
+    stays byte-identical."""
     sf = (word >> 31) & 1
 
     # ---- ADD/SUB (immediate): sf op S 100010 sh imm12 Rn Rd
@@ -486,10 +524,65 @@ def decode(pc, word):
     if word in (0xD5033FBF, 0xD5033F9F, 0xD5033FDF):
         return {"kind": "barrier", "pc": pc}
 
+    if module:
+        # ---- ADRP: op=1 1 immlo 10000 immhi Rd (PC page in GUEST VAs) ----
+        if (word & 0x9F000000) == 0x90000000:
+            imm = ((word >> 5) & 0x7FFFF) << 2 | ((word >> 29) & 3)
+            return {"kind": "adrp", "pc": pc, "imm": imm,
+                    "value": ((pc & ~0xFFF) + (sx(imm, 21) << 12))
+                             & 0xFFFFFFFFFFFFFFFF,
+                    "rd": word & 0x1F}
+
+        # ---- ADR: op=0 0 immlo 10000 immhi Rd -----------------------------
+        if (word & 0x9F000000) == 0x10000000:
+            imm = ((word >> 5) & 0x7FFFF) << 2 | ((word >> 29) & 3)
+            return {"kind": "adr", "pc": pc,
+                    "value": (pc + sx(imm, 21)) & 0xFFFFFFFFFFFFFFFF,
+                    "rd": word & 0x1F}
+
+        # ---- Logical (shifted register): sf opc 01010 shift N=0 imm6 ----
+        #      AND/ORR/EOR only (opc 3 == ANDS is excluded), ROR excluded,
+        #      imm6 must be in range for the operand size. ORR Rd,XZR,Rm is
+        #      the MOV (register) alias: Rn == 31 is XZR in this form.
+        if ((word >> 24) & 0x1F) == 0x0A and ((word >> 21) & 1) == 0:
+            opc = (word >> 29) & 3
+            shift = (word >> 22) & 3
+            imm6 = (word >> 10) & 0x3F
+            width = 64 if sf else 32
+            if opc not in (0, 1, 2):
+                raise DecodeError("logical shifted register opc 3 (ANDS) not "
+                                  "in subset")
+            if shift == 3:
+                raise DecodeError("reserved shift type (ROR)")
+            if imm6 >= width:
+                raise DecodeError("shift amount out of range for operand size")
+            return {"kind": "logic_shift", "pc": pc, "op": opc,
+                    "shift": shift, "imm6": imm6,
+                    "rm": (word >> 16) & 0x1F, "rn": (word >> 5) & 0x1F,
+                    "rd": word & 0x1F, "width": width}
+
+        # ---- NOP ---------------------------------------------------------
+        if word == 0xD503201F:
+            return {"kind": "nop", "pc": pc}
+
+        # ---- MRS Xt, <sysreg>: only the four registers below are modeled.
+        #      MSR (0xD51...) does not match this mask and fails closed below.
+        if (word & 0xFFF00000) == 0xD5300000:
+            sysreg16 = (word >> 5) & 0xFFFF
+            rt = word & 0x1F
+            if sysreg16 in SYSREG_COUNTERS:
+                return {"kind": "mrs_counter", "pc": pc,
+                        "sysreg16": sysreg16, "rt": rt}
+            if sysreg16 in SYSREG_TPIDR:
+                return {"kind": "mrs_tpidr", "pc": pc,
+                        "field": SYSREG_TPIDR[sysreg16], "rt": rt}
+            raise DecodeError("unsupported MRS sysreg field 0x%04x" % sysreg16)
+
     raise DecodeError("unsupported instruction encoding 0x%08x" % word)
 
 
-TERMINATORS = {"b", "bcond", "bl", "cbz", "cbnz", "br", "blr", "ret", "svc"}
+TERMINATORS = {"b", "bcond", "bl", "cbz", "cbnz", "br", "blr", "ret",
+               "svc", "mrs_counter"}
 
 
 def successors(ins):
@@ -504,6 +597,11 @@ def successors(ins):
     if k == "blr":
         return [pc + 4]
     if k == "svc":
+        return [pc + 4]
+    if k == "mrs_counter":
+        # AOT_EXIT_SYSREG resumes at site_pc + 4 through the handler, so the
+        # following instruction must be its own block entry: the block ends
+        # at the MRS and pc + 4 is seeded as a CFG start.
         return [pc + 4]
     return []
 
@@ -538,14 +636,27 @@ def validate_thunks(thunks, ranges):
 
 # ---------------------------------------------------------------- CFG
 
-def build_cfg(raw, ranges, entries, indirect_targets):
+def build_cfg(raw, ranges, entries, indirect_targets, base=0, module=False):
+    """Recover the reachable CFG.
+
+    `ranges` and the entry/target PCs are GUEST virtual addresses; `base` is
+    the guest VA of flat offset 0 (0 for the legacy single-image G2 mode, where
+    file offsets and guest PCs are the same thing). A word at guest PC `pc` is
+    read from `raw[pc - base]`. Only code reachable from the entries/targets is
+    decoded, so data words inside the text segment (the crt0 MOD0 offset, the
+    MOD0 struct, ...) are never decoded.
+    """
     for i, (s, e) in enumerate(ranges):
         if s >= e:
             raise DecodeError("range %d: start >= end" % i)
         if (s % 4) != 0 or (e % 4) != 0:
             raise DecodeError("range %d: not 4-byte aligned" % i)
-        if e > len(raw):
-            raise DecodeError("range %d: end 0x%x exceeds file size 0x%x" % (i, e, len(raw)))
+        if s < base:
+            raise DecodeError("range %d: start 0x%x below the image base 0x%x"
+                              % (i, s, base))
+        if e - base > len(raw):
+            raise DecodeError("range %d: end 0x%x exceeds file size 0x%x"
+                              % (i, e, len(raw) + base))
         if i and s < ranges[i - 1][1]:
             raise DecodeError("range %d: overlaps or unsorted" % i)
 
@@ -568,8 +679,8 @@ def build_cfg(raw, ranges, entries, indirect_targets):
                 raise DecodeError("misaligned decode at 0x%x" % cur)
             if not in_ranges(ranges, cur):
                 raise DecodeError("execution leaves declared ranges at 0x%x" % cur)
-            word = struct.unpack_from("<I", raw, cur)[0]
-            ins = decode(cur, word)
+            word = struct.unpack_from("<I", raw, cur - base)[0]
+            ins = decode(cur, word, module=module)
             ins["word"] = word
             visited[cur] = ins
             if ins["kind"] in TERMINATORS:
@@ -669,6 +780,56 @@ def emit_insn(ins, out):
                 else ("aot_sub64" if width == 64 else "aot_sub32")
             call = "%s(s, %s, %s, 0)" % (use(fn), a, b)
             out.append("    %s(s, %uu, %s);" % (use("aot_set_zr"), ins["rd"], call))
+    elif k in ("adrp", "adr"):
+        # Value is fully resolved at translation time from the ABSOLUTE guest
+        # PC, so a page-base mistake in the module offset cannot survive.
+        aot_val = ins["value"]
+        if MUTANT == "adrp_offset" and k == "adrp":
+            # TEST-ONLY wrong implementation: ADRP paged from the MODULE
+            # OFFSET instead of the absolute guest VA.
+            aot_val = (((ins["pc"] - MODULE_BASE) & ~0xFFF) +
+                       (sx(ins["imm"], 21) << 12)) & 0xFFFFFFFFFFFFFFFF
+        out.append("    %s(s, %uu, 0x%016xull);"
+                   % (use("aot_set_zr"), ins["rd"], aot_val))
+    elif k == "logic_shift":
+        width = ins["width"]
+        a = "%s(s, %uu)" % (use("aot_gpr_zr"), ins["rn"])
+        b = "%s(s, %uu)" % (use("aot_gpr_zr"), ins["rm"])
+        if not (ins["imm6"] == 0 and ins["shift"] == 0):
+            if MUTANT == "orr_noshift" and ins["op"] == 1:
+                # TEST-ONLY wrong implementation: ORR (shifted register)
+                # silently drops the shift amount.
+                pass
+            else:
+                b = "%s(%s, %uu, %uu, %uu)" % (use("aot_shift"), b, width,
+                                               ins["shift"], ins["imm6"])
+        op = {0: "&", 1: "|", 2: "^"}[ins["op"]]
+        if width == 32:
+            a = "(uint32_t)(%s)" % a
+            b = "(uint32_t)(%s)" % b
+        expr = "%s %s %s" % (a, op, b)
+        if width == 32:
+            # 32-bit form: both operands are truncated and the result is
+            # zero-extended into the 64-bit register, exactly like the other
+            # 32-bit lowerings (a plain `uint32_t` result would be
+            # sign-extended by an int-promoting compiler if uint32_t were
+            # narrower than int).
+            expr = "(uint64_t)(uint32_t)(%s)" % expr
+        out.append("    %s(s, %uu, %s);"
+                   % (use("aot_set_zr"), ins["rd"], expr))
+    elif k == "nop":
+        out.append("    /* nop */")
+    elif k == "mrs_counter":
+        # Program mode: the runtime delivers the value through a SYSREG HLE
+        # request whose id folds the sysreg field and Rt (XZR discard is the
+        # handler's aot_sysreg_write_dest rule).
+        out.append("    rt->site_pc = 0x%xull;" % pc)
+        out.append("    rt->hle_id = AOT_SYSREG_ID(0x%04xu, %uu);"
+                   % (ins["sysreg16"], ins["rt"]))
+        out.append("    return AOT_EXIT_SYSREG;")
+    elif k == "mrs_tpidr":
+        out.append("    %s(s, %uu, s->%s);"
+                   % (use("aot_set_zr"), ins["rt"], ins["field"]))
     elif k == "b":
         out.append("    rt->site_pc = 0x%xull;" % pc)
         out.append("    rt->next_pc = 0x%xull;" % ins["target"])
@@ -795,7 +956,40 @@ def emit_insn(ins, out):
             out.append("        %s(s, %uu, aot_v0);" % (use("aot_set_zr"), ins["rt"]))
             out.append("        %s(s, %uu, aot_v1);" % (use("aot_set_zr"), ins["rt2"]))
         else:
-            if ins["width"] == 64:
+            # Major 1: in MODULE mode a pair store is ONE access. The old
+            # lowering emitted two independent stores, so a pair straddling a
+            # RW->R page boundary wrote the first half and then faulted, leaving
+            # 8 guest bytes modified by an instruction that must be all-or-
+            # nothing (the hardware raises the fault before either half lands).
+            #   STP x: one 16-byte store of {Rt, Rt2}      -> mem_st128
+            #   STP w: one 8-byte store of  Rt | Rt2 << 32  -> mem_st64
+            # The G2 single-image path keeps the original two-store text byte
+            # for byte (aot_g2_gen_identity pins it).
+            if MODULE_MODE and MUTANT != "stp_split":
+                if ins["width"] == 64:
+                    # aot_mem_st128 is an aot_mem.c symbol (like aot_mem_st64
+                    # above), not a generated helper: never route it through use().
+                    out.append("        AotMemStatus aot_ms = aot_mem_st128(&rt->mem, aot_addr, "
+                               "(const uint64_t[2]){ (uint64_t)%s(s, %uu), "
+                               "(uint64_t)%s(s, %uu) });"
+                               % (use("aot_gpr_zr"), ins["rt"],
+                                  use("aot_gpr_zr"), ins["rt2"]))
+                    out.append("        if (aot_ms != AOT_MEM_OK) return %s(rt, aot_addr, (int64_t)aot_ms);" % mk)
+                else:
+                    out.append("        AotMemStatus aot_ms = aot_mem_st64(&rt->mem, aot_addr, "
+                               "((uint64_t)(uint32_t)%s(s, %uu)) | "
+                               "((uint64_t)(uint32_t)%s(s, %uu) << 32));"
+                               % (use("aot_gpr_zr"), ins["rt"],
+                                  use("aot_gpr_zr"), ins["rt2"]))
+                    out.append("        if (aot_ms != AOT_MEM_OK) return %s(rt, aot_addr, (int64_t)aot_ms);" % mk)
+            elif MUTANT == "stp_split" and MODULE_MODE and ins["width"] == 64:
+                # TEST-ONLY wrong-implementation control: the pre-Major-1
+                # two-store lowering, which partially writes a straddling pair.
+                out.append("        AotMemStatus aot_ms = aot_mem_st64(&rt->mem, aot_addr, %s(s, %uu));" % (use("aot_gpr_zr"), ins["rt"]))
+                out.append("        if (aot_ms != AOT_MEM_OK) return %s(rt, aot_addr, (int64_t)aot_ms);" % mk)
+                out.append("        aot_ms = aot_mem_st64(&rt->mem, aot_addr + 8u, %s(s, %uu));" % (use("aot_gpr_zr"), ins["rt2"]))
+                out.append("        if (aot_ms != AOT_MEM_OK) return %s(rt, aot_addr + 8u, (int64_t)aot_ms);" % mk)
+            elif ins["width"] == 64:
                 out.append("        AotMemStatus aot_ms = aot_mem_st64(&rt->mem, aot_addr, %s(s, %uu));" % (use("aot_gpr_zr"), ins["rt"]))
                 out.append("        if (aot_ms != AOT_MEM_OK) return %s(rt, aot_addr, (int64_t)aot_ms);" % mk)
                 out.append("        aot_ms = aot_mem_st64(&rt->mem, aot_addr + 8u, %s(s, %uu));" % (use("aot_gpr_zr"), ins["rt2"]))
@@ -934,11 +1128,20 @@ def emit_insn(ins, out):
         raise DecodeError("codegen: unknown kind %s" % k)
 
 
-def emit_c(name, blocks, ranges, sha, fnv, thunks):
+def emit_c(name, blocks, ranges, sha, fnv, thunks, subset_id=AOT_SUBSET_ID,
+           abi_expr="AOT_ABI_VERSION", provenance=None):
+    """Emit one AotImage translation unit.
+
+    Defaults reproduce the legacy G2 single-image ABI-v1 output byte for
+    byte. G3 module mode passes its own subset id, the Program ABI version
+    symbol, and the module flat SHA-256 as the image source identity.
+    """
     head = []
     head.append("/* Generated by tools/aot/aot_translate.py -- DO NOT EDIT.")
-    head.append(" * subset: %s" % AOT_SUBSET_ID)
+    head.append(" * subset: %s" % subset_id)
     head.append(" * source sha256: %s" % sha)
+    if provenance is not None:
+        head.append(" * provenance: %s" % provenance)
     head.append(" * fixture fnv1a64: 0x%016x (quick check only)" % fnv)
     head.append(" */")
     head.append('#include "aot_runtime.h"')
@@ -975,8 +1178,8 @@ def emit_c(name, blocks, ranges, sha, fnv, thunks):
     out.append("};")
     out.append("")
     out.append("const AotImage aot_image_%s = {" % name)
-    out.append('    "%s",' % AOT_SUBSET_ID)
-    out.append("    AOT_ABI_VERSION, AOT_STATE_LAYOUT,")
+    out.append('    "%s",' % subset_id)
+    out.append("    %s, AOT_STATE_LAYOUT," % abi_expr)
     out.append('    "%s",' % sha)
     out.append("    0x%016xull," % fnv)
     out.append("    aot_blocks_%s, sizeof(aot_blocks_%s) / sizeof(aot_blocks_%s[0]),"
@@ -1015,16 +1218,173 @@ def emit_c(name, blocks, ranges, sha, fnv, thunks):
     return "\n".join(head + helpers + out)
 
 
+def module_layout_ranges(layout, guest_base):
+    """The decoded code range(s) in GUEST virtual addresses: the text
+    segment only, so rodata/data (including the crt0 MOD0 words that precede
+    the text in a real image) are never decoded."""
+    text_off, text_size = layout["text"]
+    if text_size <= 0:
+        raise DecodeError("layout text segment is empty")
+    return [(guest_base + text_off, guest_base + text_off + text_size)]
+
+
+def read_entries(path):
+    with open(path, "rb") as f:
+        data = json.loads(f.read().decode("utf-8"))
+    if isinstance(data, dict):
+        data = data.get("entries")
+    if not isinstance(data, list):
+        raise DecodeError("entries file must be a JSON array of guest VAs")
+    entries = []
+    for v in data:
+        if isinstance(v, bool) or not isinstance(v, (int, str)):
+            raise DecodeError("bad entry value %r" % (v,))
+        pc = int(v, 0) if isinstance(v, str) else int(v)
+        if pc < 0 or pc > 0xFFFFFFFFFFFFFFFF:
+            raise DecodeError("entry 0x%x out of range" % pc)
+        entries.append(pc)
+    if not entries:
+        raise DecodeError("module has no entries (nothing to translate)")
+    return sorted(set(entries))
+
+
+def run_module(args):
+    """--module: translate one linked module flat into an ABI-v2 image."""
+    global MODULE_BASE, MODULE_MODE
+    MODULE_BASE = 0
+    MODULE_MODE = 1
+    for opt, val in (("--flat", args.flat), ("--layout", args.layout),
+                     ("--guest-base", args.guest_base),
+                     ("--entries", args.entries)):
+        if val is None:
+            sys.stderr.write("aot_translate: FAIL-CLOSED: --module requires %s\n" % opt)
+            return 1
+    with open(args.flat, "rb") as f:
+        raw = f.read()
+    with open(args.layout, "rb") as f:
+        layout_bytes = f.read()
+    with open(__file__, "rb") as f:
+        gen_bytes = f.read()
+    try:
+        layout = json.loads(layout_bytes.decode("utf-8"))
+        guest_base = int(args.guest_base, 0)
+        MODULE_BASE = guest_base
+        # Minor 8: the module base is a PAGE base inside the guest window the
+        # loader enforces ([2^32, 2^39)). A 4-byte-aligned or out-of-window base
+        # would produce an image whose code ranges can never be mapped by
+        # aot_as (page granularity) or bound by build_program, so it is rejected
+        # here instead of at load time.
+        if guest_base % AOT_AS_PAGE_BYTES != 0 or guest_base < AOT_AS_MIN_ADDR \
+                or guest_base >= AOT_AS_MAX_ADDR:
+            raise DecodeError("guest base 0x%x is not a 4 KiB aligned base "
+                              "inside [0x%x, 0x%x)"
+                              % (guest_base, AOT_AS_MIN_ADDR, AOT_AS_MAX_ADDR))
+        if len(raw) != layout["image_size"] - layout.get("bss_size", 0):
+            raise DecodeError("flat size 0x%x disagrees with layout image_size "
+                              "0x%x - bss 0x%x"
+                              % (len(raw), layout["image_size"],
+                                 layout.get("bss_size", 0)))
+        flat_sha = hashlib.sha256(raw).hexdigest()
+        if layout.get("sha256") and layout["sha256"] != flat_sha:
+            raise DecodeError("flat SHA-256 0x%s does not match layout.json"
+                              % flat_sha[:16])
+        ranges = module_layout_ranges(layout, guest_base)
+        entries = read_entries(args.entries)
+        for pc in entries:
+            if not in_ranges(ranges, pc):
+                raise DecodeError("entry 0x%x is outside the text segment" % pc)
+        blocks, _visited = build_cfg(raw, ranges, entries, [],
+                                     base=guest_base, module=True)
+        # Provenance of the translation (evidence only); the image identity is
+        # the module flat SHA-256 the loader binds the descriptor to.
+        h = hashlib.sha256()
+        h.update(raw)
+        h.update(layout_bytes)
+        h.update(gen_bytes)
+        h.update(TOOL_CONFIG_MODULE.encode("ascii"))
+        h.update((";subset=%s;abi=%u;layout=%u;base=0x%x;mutant=%s"
+                  % (AOT_MODULE_SUBSET_ID, AOT_ABI_VERSION_PROGRAM,
+                     AOT_STATE_LAYOUT, guest_base,
+                     MUTANT if MUTANT else "-")).encode("ascii"))
+        provenance = h.hexdigest()
+        fnv = 0xCBF29CE484222325
+        for b in raw:
+            fnv ^= b
+            fnv = (fnv * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+        text = emit_c(args.name, blocks, ranges, flat_sha, fnv,
+                      (0, 0, 0), subset_id=AOT_MODULE_SUBSET_ID,
+                      abi_expr="AOT_ABI_VERSION_PROGRAM",
+                      provenance="sha256 %s (translator+layout, flat %s)"
+                                 % (provenance, flat_sha[:16]))
+    except DecodeError as e:
+        sys.stderr.write("aot_translate: FAIL-CLOSED: %s\n" % e)
+        return 1
+    except (KeyError, TypeError, ValueError) as e:
+        sys.stderr.write("aot_translate: FAIL-CLOSED: malformed layout: %s\n" % e)
+        return 1
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(text)
+    if args.meta_out:
+        meta = {"name": args.name, "mode": "module",
+                "subset_id": AOT_MODULE_SUBSET_ID,
+                "abi_version": AOT_ABI_VERSION_PROGRAM,
+                "state_layout": AOT_STATE_LAYOUT,
+                "guest_base": "0x%x" % guest_base,
+                "source_sha256": flat_sha,
+                "provenance_sha256": provenance,
+                "fnv1a64": "0x%016x" % fnv,
+                "ranges": [list(r) for r in ranges],
+                "entries": ["0x%x" % e for e in entries],
+                "thunks": {"base": 0, "count": 0, "stride": 0},
+                "blocks": []}
+        for blk in blocks:
+            last = blk["insns"][-1]
+            succ = successors(last) if last["kind"] in TERMINATORS \
+                else [last["pc"] + 4]
+            meta["blocks"].append({"pc": "0x%x" % blk["pc"],
+                                   "end_pc": "0x%x" % (last["pc"] + 4),
+                                   "terminator": last["kind"],
+                                   "next": ["0x%x" % t for t in succ]})
+        with open(args.meta_out, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+            f.write("\n")
+    sys.stderr.write("aot_translate: module %s: %d blocks, %d entries, "
+                     "sha=%s\n" % (args.name, len(blocks), len(entries),
+                                   flat_sha[:16]))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", required=True)
-    ap.add_argument("--bin", required=True, dest="binfile")
+    ap.add_argument("--manifest", default=None)
+    ap.add_argument("--bin", default=None, dest="binfile")
     ap.add_argument("--out", required=True)
     ap.add_argument("--name", required=True)
     ap.add_argument("--meta-out", dest="meta_out", default=None)
     ap.add_argument("--mutant", default=None, choices=list(MUTANTS))
+    ap.add_argument("--module", action="store_true",
+                    help="G3 module mode: one linked module flat -> ABI-v2 image")
+    ap.add_argument("--flat", default=None)
+    ap.add_argument("--layout", default=None)
+    ap.add_argument("--guest-base", dest="guest_base", default=None)
+    ap.add_argument("--entries", default=None)
     args = ap.parse_args()
     global MUTANT
+    if args.module:
+        if args.mutant is not None and args.mutant not in MODULE_MUTANTS:
+            sys.stderr.write("aot_translate: FAIL-CLOSED: --mutant is G2-only\n")
+            return 1
+        globals()["MUTANT"] = args.mutant
+        return run_module(args)
+    if args.mutant is not None and args.mutant in MODULE_MUTANTS:
+        sys.stderr.write("aot_translate: FAIL-CLOSED: --mutant %s is module-mode "
+                         "only (use --module)\n" % args.mutant)
+        return 1
+    if args.manifest is None or args.binfile is None:
+        sys.stderr.write("aot_translate: FAIL-CLOSED: --manifest and --bin are "
+                         "required outside --module mode\n")
+        return 1
     MUTANT = args.mutant
 
     with open(args.manifest, "rb") as f:

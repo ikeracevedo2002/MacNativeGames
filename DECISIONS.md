@@ -113,7 +113,9 @@ Consequences:
 
 ## D010 — Canonical guest-state ABI and finite native block exits
 
-**Status:** Accepted (scoped to the G2 proof; D008 remains OPEN)
+**Status:** Accepted (scoped to the G2 proof; D008 remains OPEN). For ABI-v2 Program images, the HOSTCALL
+resume rule and BR-into-thunk rejection are superseded by D015 and the no-reentry rule by D016; ABI-v1 G2
+images are unchanged.
 
 The translated-code ABI uses one owned struct `AotGuestState`
 (`src/aot/aot_abi.h`): `x[31]` (x0..x30, with x18 an ordinary guest GPR),
@@ -240,3 +242,135 @@ identity, and does not choose a global backend (D008 remains OPEN). It is
 guarded by the translated-memory concurrency schedule tests, their
 `AOT_MEM_TEST_NO_INVALIDATION` wrong-backend control, and the independent
 Capstone CFG checker for exact per-chunk ranges.
+
+## D014 — Explicit guest address space with Horizon page permissions
+
+**Status:** Accepted (G3; D008 remains OPEN)
+
+Guest virtual addresses are a 64-bit space disjoint from host addresses. Host code never dereferences a
+guest VA; every guest access goes through `aot_mem_*` / `aot_as_*` (`src/aot/aot_as.{h,c}`), still serialized
+under the single D013 domain lock. Regions are 4 KiB-granular, sorted and disjoint, restricted to
+[2^32, 2^39) (nothing is mappable below 4 GiB, so 32-bit pointer truncation is detectable; the upper bound
+is Horizon's 39-bit address space). Each page carries a Horizon permission {---, R--, RW-, R-X}, a state
+(3 = module code/rodata, 4 = module data) and the permanent RELRO lock attribute (16). Loads need R, stores
+need W; R-X pages are readable as data (MOD0/literal reads) but "execute" only means "dispatchable through a
+translated block table". Spanning accesses check every page before any byte is written. The region table is
+built through an init-only path and frozen at seal; a failed load poisons the space so it can never be
+sealed. The HOST protection of a guest page is never executable: guest R-X maps to host PAGE_READONLY
+(guest X is bookkeeping plus the dispatch check), RW- to read/write, R-- to read-only, --- to no access, so no
+ARM64 payload ever sits in host-executable memory and no host-executable memory is allocated at run time. A
+G2 single arena is unchanged (no address space attached).
+
+Reason: the Mac port identity-maps guest VA == host VA and writes host pointers into guest memory; that is
+not valid with translated code (a guest function pointer is not an x86-64 function pointer), and an explicit
+space makes permission, truncation and wild-pointer faults deterministic and testable. Identity mapping
+remains a possible later backend optimization behind the same interface (performance is out of scope).
+
+Evidence: `aot_g3_as` (region rules incl. the exact 2^39 bound, permission matrix, zero-byte spanning
+stores, protect/lock/query, host protection queried through `host_vm_query` and `VirtualQuery` with no
+`PAGE_EXECUTE*` bit), the post-seal permission checks in `aot_g3_link`, and the runtime mutant driver
+(`aot_g3_runtime_mutants`: NO_PERM, PARTIAL_STORE, HOST_EXEC among 13, all rejected).
+
+Consequences: supersedes D009's "fixed guest VA layout deferred to G3" and extends D013 from one arena to a
+region table. Bulk/zero-copy host access (GPU, filesystem) and the guest heap/alias/stack layout reported by
+svcGetInfo are OPEN (G4+). Guest memory faults are typed software faults (no host exception path is needed
+for them); a host VEH/SEH policy is still a separate open item.
+
+## D015 — Program dispatch, ABI v2 and host thunks as guest functions
+
+**Status:** Accepted (G3; D008 remains OPEN)
+
+A linked Program is an immutable set of ABI-v2 images (`AOT_ABI_VERSION_PROGRAM`, subset "g3-module-v1")
+with disjoint guest text ranges plus one host-thunk region and one host-return sentinel region (both
+unmapped for data). One AotRuntime per guest thread shares the Program. Every next PC, whatever exit
+produced it, resolves as: misaligned -> MISALIGNED; sentinel -> host return (D016); thunk -> host call;
+inside an image's text -> its block or UNTRANSLATED; otherwise UNKNOWN_PC. Guest code pointers are always
+guest VAs. A thunk VA behaves as a guest function `{ handler(); ret }`: entering it by BL/BLR/BR/B/cond/
+fallthrough captures r = x30 AT ENTRY, which must already be a translated entry or the active sentinel slot
+(else BAD_RESUME without calling the handler); the handler may change x30 but control resumes at r; entry
+via RET is BAD_TRANSFER. One thunk per symbol name program-wide (function-pointer equality across modules).
+`mrs` of CNTPCT_EL0/CNTVCT_EL0 is a new HLE kind AOT_HLE_SYSREG (id = sysreg16<<8 | Rt, resume site+4);
+handlers are keyed by the system register (Rt masked) and write the destination themselves (Rt=31 discards).
+
+Evidence: `aot_g3_program` (fake-block images: every thunk entry kind, BAD_RESUME without handler call,
+handler x30 clobber, BAD_TRANSFER, UNTRANSLATED vs UNKNOWN_PC vs MISALIGNED, SYSREG incl. XZR), `aot_g3_exec`
+on translated fixture modules (PLT `br x17` into an override thunk with exact site/resume, thunk identity
+across modules, SYSREG with Rt 0/8/31 and CNTVCT/TPIDR), the Unicorn oracle `aot_g3_exec_oracle`, and the
+runtime/exec mutant drivers (THUNK_SITE4, RESUME_AFTER, HANDLER_BEFORE_RESUME_CHECK, SYSREG_XZR, ...).
+
+Reason: real NSO PLT stubs (`adrp x16; ldr x17,[x16,#off]; add x16,x16,#off; br x17`, reached by BL) make
+"BR into a thunk with the caller's x30" the normal path to an HLE-overridden import; G2 rejected it
+(AOT_FAULT_TAIL_THUNK). Resolving thunks for every exit kind closes the RET/B gaps found in review.
+
+Consequences: changes D010's HOSTCALL resume definition and lifts its BR-into-thunk rejection for ABI-v2
+images only; ABI-v1 G2 images keep the legacy single-image semantics byte-for-byte. AOT_STATE_LAYOUT and the
+816-byte AotGuestState are unchanged.
+
+## D016 — Synchronous host->guest calls (nested and top-level)
+
+**Status:** Accepted (G3; thread exit/unwinding is OPEN for G4)
+
+`aot_call_guest(rt, fn, args<=8, &x0)` is legal at depth 0 on the owning OS thread or from inside a Program
+handler (depth+1, max 16). It sets x0..x7 and x30 = sentinel slot of this depth, requires a 16-byte-aligned
+SP, clears the local exclusive monitor on entry/exit, and completes only when a RET reaches this depth's
+slot with SP equal to the entry SP (else BAD_RETURN). AAPCS64 callee-saved state (SP, x19-x29, low 64 of
+v8-v15, FPCR) is VERIFIED (ABI_VIOLATION), never restored. The runtime saves/restores its own per-block
+scratch around the nested loop; the step budget and evidence logs are shared and never reset; an inner fault
+is sticky and terminates the outer run even if the handler ignores it; a handler cannot start another nested
+call after a sticky fault. Guest thread exit at depth > 0 fails closed (AOT_FAULT_EXIT_IN_NESTED reserved).
+
+Reason: the Mac boot path is host->guest->host->guest (nn::init::Start calls the host module_inits callback,
+which calls each module's DT_INIT), and host services call guest allocators/events; D010 forbade reentry.
+
+Evidence: `aot_g3_program` (depth limit, wrong slot/SP/transfer -> BAD_RETURN, ABI_VIOLATION, scratch and
+step accounting, sticky fault incl. the no-recall rule, foreign-thread rejection without touching the owner's
+runtime, 4 threads x 1000 calls) and `aot_g3_exec` on translated modules (observer calling the real nnMain
+nested, HLE->guest callback preserving x19-x28, and the nn::init::Start-shaped module_inits handler running
+main/sub/sdk DT_INIT nested with an exact global constructor order), plus the mutants NO_DEPTH_CHECK,
+NO_SCRATCH_SAVE, RESET_STEPS, DROP_STICKY, NO_ABI_CHECK, RECALL_AFTER_FAULT (all rejected).
+
+Consequences: supersedes D010's "no host recursion / host->guest reentry not supported" and generalizes the
+G2 STOP sentinel for ABI-v2 programs. Fibers/longjmp across a host frame are unsupported (detected at the
+next sentinel by slot/SP checks).
+
+## D017 — Module link contract and exact-version verification
+
+**Status:** Accepted (G3)
+
+Modules are flat NSO memory images (text|rodata|data + bss; MOD0 at the u32 at +4) mapped at fixed guest
+bases chosen at AOT time, three regions per module (text R-X state 3, rodata R state 3, data+bss RW state 4).
+Each module descriptor pins the flat image SHA-256, the layout (incl. the NSO dynsym count used when there is
+no DT_HASH) and an expected link digest; the loader verifies every image before adding any region, then
+relocates RELR+RELA+JMPREL (sites may not overlap any table the loader consumes) with kinds 257/1025 (S+A, also for thunk targets and unresolved weak = A), 1026 (S;
+addend must be 0), 1027 (B+A, 0 <= A < image size); sites must be 8-aligned inside the data segment and
+unique. Resolution order follows the Mac reference: JUMP_SLOT observer; override; own module's first defined
+symbol; global search in module order (main, subsdk0, sdk); unresolved weak = 0+A; unresolved strong = link
+failure naming module and symbol. SHN_ABS/reserved indices, STT_TLS and defined values beyond the image are
+rejected (value == image size, e.g. the linker `end` symbol, is valid). All written values are guest VAs.
+The link digest (SHA-256 of the relocated data segments) must equal the one computed offline by an
+independent Python reference linker. Constructors: only DT_INIT is called (it walks its own init_array); the descriptor's init VA must agree with the
+image's DT_INIT. The MOD0 bss rule is data_file_end <= bss_start <= bss_end <= image_size with image_size in
+{bss_end, page_up(bss_end)} (real 1.0.0 modules align bss_start up and pin the page-rounded end, where the
+linker symbol `end` lives). Loader stages are ordered and single-shot; a failure before seal poisons the
+address space (it can never be sealed or run), while a stage re-run after seal is a typed error that touches
+nothing. A module may be declared link-only BY NAME (mapped and relocated, no translated image); any transfer
+into it faults. Images bind to descriptors by flat SHA-256 and their code ranges must lie inside the module's
+text. Real game modules are validated only locally and opt-in (CMake cache var MN_TOTK_V0_DIR); repository
+tests never require game data and real-module artifacts never enter the tree (D006).
+
+Reason: exact-version discipline (GOAL requirement 5) and the Mac loader as executable specification (D004),
+with deviations made explicit where Mac behavior is undefined for malformed input.
+
+Evidence: fixture modules built by ld.lld in RELA/RELR/GNU-hash-only/shadow variants, linked by the C loader
+with a per-site dump byte-identical to the independent Python reference linker and to an llvm-readelf-based
+checker (`aot_g3_link`, `aot_g3_link_reference`), 16 crafted negative images rejected with specific details
+(`aot_g3_neg`), 11 loader mutants rejected (`aot_g3_loader_mutants`); locally, the real TotK 1.0.0
+main/subsdk0/sdk link with 558,865 relocation sites byte-identical to the reference, matching link digest,
+0 unresolved strong imports under the Mac binding tables (6 observers, 171 overrides), 213 sites bound to
+thunks and 22 weak-zero sites (`aot_g3_real_link`, opt-in).
+
+Consequences: Horizon-vs-Mac symbol resolution order is not independently verified (Mac order kept, OPEN; on
+the real 1.0.0 set a global-first order would change 1,112 symbolic sites over 111 names). DT_FINI/module
+finalizers are not modeled; Mac game patches must become explicit translation-time overrides (OPEN). Entry
+discovery treats link values that land in text as code entries; a data object placed in text and referenced
+by address makes translation fail closed (code/data distinction for full-module translation is OPEN).
