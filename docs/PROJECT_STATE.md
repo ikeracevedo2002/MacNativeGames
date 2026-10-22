@@ -80,6 +80,10 @@ Stages:
   - A real-exec harness for catalog plus table builds is needed first.
 - **Decision gate after C:** adopt ahead-of-time catalog generation if it reduces the per-constructor cycle without losing guarantees; then propose a concrete D008. D007 (graphics) has its own later spike, starting with NVN 55.15 / Vulkan compatibility probing (PORTING_PLAN Phase 4).
 
+Step-by-step execution plan from Stage C to G8 (gates, stop points for D008/D025/D026/D007,
+per-step tests and negatives): `docs/EXECUTION_PLAN.md`. It is a plan, not evidence; this file
+and the documents listed at the top still win.
+
 Open questions recorded but not decided:
 - Horizon vs Mac symbol resolution order (D017).
 - Finalizers (DT_FINI) are not modeled.
