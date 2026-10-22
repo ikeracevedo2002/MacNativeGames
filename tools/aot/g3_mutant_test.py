@@ -52,6 +52,163 @@ MUTANTS = {
         "aot_as_probe",
         "R-X text page has no HOST_VM_PROT_EXEC bit",
     ),
+    # ---- boot heap window (tests/aot/aot_as_heap_probe.c) ----
+    # Each expected string is the FIRST semantic failure the control produces.
+    "aot_as_heap_mut_info5_size": (
+        "aot_as_heap_probe",
+        "heap_info reports base/max/logical size",
+    ),
+    "aot_as_heap_mut_shrink_decommit": (
+        "aot_as_heap_probe",
+        # Decommitting [0,2MiB) discards the retained bytes, so the immediate
+        # regrow cannot re-protect them (host_vm_protect rejects RESERVE pages).
+        "regrow to 2 MiB succeeds",
+    ),
+    "aot_as_heap_mut_no_monitor_invalidate": (
+        "aot_as_heap_probe",
+        "successful shrink/regrow invalidates another token reservation",
+    ),
+    "aot_as_heap_mut_recommit_retained": (
+        "aot_as_heap_probe",
+        # The monitor scenario regrows from 0 while high-water is 2 MiB, so the
+        # retained prefix is committed and the recommit is rejected there first.
+        "regrow to 2 MiB succeeds",
+    ),
+    "aot_as_heap_mut_hw_as_used": (
+        "aot_as_heap_probe",
+        "grow to the window maximum succeeds",
+    ),
+    # This control is only observable with an injected host failure, so its
+    # positive baseline is the SAME fault mode (fault_4), not the normal probe.
+    "aot_as_heap_mut_publish_before_host": (
+        "aot_as_heap_fault_4",
+        "failed shrink leaves logical size unchanged",
+    ),
+    "aot_as_heap_mut_no_desync": (
+        "aot_as_heap_fault_3",
+        "rollback failure is sticky fail-closed",
+    ),
+    "aot_as_heap_mut_publish_on_commit_fail": (
+        "aot_as_heap_fault_1",
+        "failed fresh commit leaves logical size unchanged",
+    ),
+    # ---- Immutable alias reserved window ----
+    "aot_as_alias_mut_query_state5": (
+        "aot_as_alias_probe",
+        "alias whole window queries Free/NONE/attr0",
+    ),
+    "aot_as_alias_mut_range_omit": (
+        "aot_as_alias_probe",
+        "alias first 16 bytes are claimed",
+    ),
+    "aot_as_alias_mut_heap_selects": (
+        "aot_as_alias_probe",
+        "heap_info selects the heap window, not alias",
+    ),
+    # A failed permission pre-check must still consume the reservation, so a
+    # later SC to the original RW address must report status 1 without LDXR.
+    "aot_as_alias_mut_keep_monitor_on_perm_fail": (
+        "aot_as_alias_probe",
+        "denied SC consumed the monitor",
+    ),
+    # ---- physical alias map/unmap (tests/aot/aot_as_alias_map_probe.c) ----
+    # Each expected string is the FIRST semantic failure the control produces,
+    # which is also why the baseline for a fault-seam control is its own fault
+    # build: the normal probe never reaches the injected refusal.
+    "aot_as_alias_map_mut_charge_all": (
+        "aot_as_alias_map_probe",
+        "a grow over an owned range is not charged twice",
+    ),
+    "aot_as_alias_map_mut_keep_stale": (
+        "aot_as_alias_map_probe",
+        "a re-mapped released page reads zero",
+    ),
+    "aot_as_alias_map_mut_keep_mapped": (
+        "aot_as_alias_map_probe",
+        "a released page joins the maximal Free run before it",
+    ),
+    "aot_as_alias_map_mut_query_no_run": (
+        "aot_as_alias_map_probe",
+        "an entirely unmapped alias window is one Free run",
+    ),
+    "aot_as_alias_map_mut_no_budget": (
+        "aot_as_alias_map_probe",
+        "a fresh page over the pool is LimitReached",
+    ),
+    "aot_as_alias_map_mut_omit_usage": (
+        "aot_as_alias_map_probe",
+        "usage reports the mapped alias bytes and the heap size",
+    ),
+    "aot_g3_start_hle_mut_info_const": (
+        "aot_g3_start_hle_heap_probe",
+        "Info2 returns the AS alias base, not a constant",
+    ),
+    # Positive baseline expects the real STACK role; returning ALIAS is wrong.
+    "aot_g3_start_hle_mut_info14_alias": (
+        "aot_g3_start_hle_heap_probe",
+        "Info14 returns the AS stack arena base, not a constant",
+    ),
+    # Whole-domain QueryMemory: exact semantic failures, not arbitrary nonzero.
+    "aot_as_domain_mut_low_from_addr": (
+        "aot_as_query_domain_probe", "domain low interval",
+    ),
+    "aot_as_domain_mut_gap_page": (
+        "aot_as_query_domain_probe", "domain interval",
+    ),
+    "aot_as_domain_mut_above_free": (
+        "aot_as_query_domain_probe", "domain upper interval",
+    ),
+    "aot_g3_query_mut_partial_store": (
+        "aot_g3_start_hle_query_probe",
+        "committed/free cross span fails whole and preserves the prefix",
+    ),
+    "aot_g3_query_mut_mapped_only": (
+        "aot_g3_start_hle_query_probe", "zero lower Free record",
+    ),
+    "aot_g3_start_hle_mut_sysres_const": (
+        "aot_g3_start_hle_probe", "configured system resource limit",
+    ),
+    # ---- alias SVC 0x2c/0x2d (tests/aot/aot_g3_start_hle_alias_probe.c) ----
+    "aot_g3_start_hle_mut_alias_limit_code": (
+        "aot_g3_start_hle_alias_probe",
+        "a fresh page over the pool is 0x10801",
+    ),
+    "aot_g3_start_hle_mut_alias_clobber": (
+        "aot_g3_start_hle_alias_probe",
+        "grow over an owned prefix succeeds",
+    ),
+    "aot_g3_start_hle_mut_alias_no_unmap": (
+        "aot_g3_start_hle_alias_probe",
+        "unmap reduces the mapped-page counter",
+    ),
+    "aot_g3_start_hle_mut_budget_omit_alias": (
+        "aot_g3_start_hle_alias_probe",
+        "id7 charges the mapped alias bytes",
+    ),
+    # ---- Mac host overrides (tests/aot/aot_g3_start_hle_override_probe.c) ----
+    # A void override must write NO guest register: fabricating x0=0 breaks the
+    # first void row (oe Initialize). CountAddOnContent must return 0.
+    "aot_g3_start_hle_mut_override_x0": (
+        "aot_g3_start_hle_override_probe",
+        "oe Initialize leaves every guest register, flag and byte unchanged",
+    ),
+    "aot_g3_start_hle_mut_override_count": (
+        "aot_g3_start_hle_override_probe",
+        "CountAddOnContent returns 0 in x0 and changes nothing else",
+    ),
+    # The byte witness must be non-vacuous: the same production write path
+    # (aot_as_write at the caller's x0) is exercised by this control.
+    "aot_g3_start_hle_mut_override_write": (
+        "aot_g3_start_hle_override_probe",
+        "oe Initialize writes no guest byte",
+    ),
+    # SetCpuBoostMode's Mac body is void for modes 0/1/2, so a control that only
+    # drops the runtime_fail range check still passes every VALID row; it must be
+    # caught by the first out-of-range mode row instead.
+    "aot_g3_start_hle_mut_skip_boost_range": (
+        "aot_g3_start_hle_override_probe",
+        "CPU boost rejects mode -1",
+    ),
     # ---- Program runtime (tests/aot/aot_program_probe.c) ----
     "aot_prog_mut_thunk_site4": (
         "aot_program_probe",
@@ -153,8 +310,17 @@ def main():
                     failures.append("%s:   %s" % (probe, line))
             continue
         if "all " not in out or "passed" not in out:
-            failures.append("%s: real build printed no success summary" % probe)
-            continue
+            # The probe suite has two documented success spellings: the
+            # "<probe>: all checks passed" summary and a final "PASS: <name>"
+            # line (e.g. tests/aot/g3_start_hle_probe.c). Exit 0 plus one of
+            # them is a real pass; a FAIL/FATAL line always disqualifies it.
+            passed_line = any(line.startswith("PASS: ")
+                              for line in out.splitlines())
+            bad = any(line.startswith("FAIL:") or line.startswith("FATAL:")
+                      for line in out.splitlines())
+            if not (passed_line and not bad):
+                failures.append("%s: real build printed no success summary" % probe)
+                continue
         real_ok[probe] = True
 
     # ---- 2. every mutant must be rejected for the intended reason ----

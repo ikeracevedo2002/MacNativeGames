@@ -108,6 +108,20 @@ add_library(host_time STATIC
 )
 target_include_directories(host_time PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# Narrow host CSPRNG primitive (G3 Start SVC 0x29 support).
+add_library(host_random STATIC src/host_random.c)
+target_include_directories(host_random PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(host_random PRIVATE /W4 /WX)
+target_link_libraries(host_random PUBLIC bcrypt)
+
+# Deterministic backend test: includes host_random.c with a fake private
+# compile-time provider, so it must not link the real host_random object.
+add_executable(host_random_backend_probe tests/aot/host_random_backend_probe.c)
+target_include_directories(host_random_backend_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(host_random_backend_probe PRIVATE /W4 /WX)
+add_test(NAME host_random_backend COMMAND host_random_backend_probe)
+
 # Deterministic conversion tests (fixed constants + own negative controls).
 add_executable(host_time_convert_test
     tests/test_host_time_convert.c
@@ -189,6 +203,129 @@ add_executable(host_log_probe
 target_link_libraries(host_log_probe PRIVATE host_log)
 
 # ---- Tests --------------------------------------------------------------
+
+# ---- Immutable RomFS provider (early G4 prerequisite, D020) -------------
+#
+# Deliberately NOT behind MN_BUILD_AOT_PROOF: the provider is plain C and must
+# build and test without Python, LLVM, Unicorn/Capstone or any game data. It
+# reuses the audited FIPS 180-4 SHA-256 from src/aot/aot_sha256.c and does not
+# link the interpreter/runtime. The Windows file/path seam is private
+# (src/romfs_file_win.*); the public header stays Windows-free.
+add_library(romfs_provider STATIC
+    src/romfs_provider.c
+    src/romfs_file_win.c
+    src/aot/aot_sha256.c
+)
+target_include_directories(romfs_provider PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(romfs_provider PRIVATE /W4 /WX)
+
+# Hermetic fixture probe: tiny synthetic index/image/parts/overlays written to
+# an EXTERNAL directory (the build dir), with independently pinned SHA-256
+# expectations and no game data.
+add_executable(romfs_provider_probe
+    tests/romfs_provider_probe.c
+)
+target_link_libraries(romfs_provider_probe PRIVATE romfs_provider)
+target_compile_options(romfs_provider_probe PRIVATE /W4 /WX)
+add_test(NAME romfs_provider
+    COMMAND romfs_provider_probe "${CMAKE_BINARY_DIR}")
+set_tests_properties(romfs_provider PROPERTIES TIMEOUT 120)
+
+# Wrong-implementation controls: the SAME sources with one test-only define
+# that suppresses exactly one integrity check. Each must be rejected by the
+# probe with the exact first failure listed in
+# tests/romfs_provider_mutant_driver.c. Not registered as passing tests.
+set(ROMFS_MUTANT_TARGETS "")
+foreach(mut SKIP_INDEX_HASH SKIP_IMAGE_HASH)
+    string(TOLOWER "${mut}" mut_lc)
+    add_executable(romfs_provider_mut_${mut_lc}
+        tests/romfs_provider_probe.c
+        src/romfs_provider.c
+        src/romfs_file_win.c
+        src/aot/aot_sha256.c
+    )
+    target_include_directories(romfs_provider_mut_${mut_lc} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(romfs_provider_mut_${mut_lc} PRIVATE
+        MN_ROMFS_MUT_${mut})
+    target_compile_options(romfs_provider_mut_${mut_lc} PRIVATE /W4 /WX)
+    list(APPEND ROMFS_MUTANT_TARGETS "$<TARGET_FILE:romfs_provider_mut_${mut_lc}>")
+endforeach()
+
+# Native driver: the real probe must exit 0/PASS first, then each mutant must
+# exit exactly 2 with its contracted first failure. No shell, no WILL_FAIL.
+add_executable(romfs_provider_mutant_driver
+    tests/romfs_provider_mutant_driver.c
+)
+target_compile_options(romfs_provider_mutant_driver PRIVATE /W4 /WX)
+add_test(NAME romfs_provider_mutants
+    COMMAND romfs_provider_mutant_driver "${CMAKE_BINARY_DIR}"
+        "$<TARGET_FILE:romfs_provider_probe>"
+        "$<TARGET_FILE:romfs_provider_mut_skip_index_hash>"
+        "bad index digest is rejected"
+        "$<TARGET_FILE:romfs_provider_mut_skip_image_hash>"
+        "same-size changed image is rejected")
+set_tests_properties(romfs_provider_mutants PROPERTIES TIMEOUT 180)
+
+# ---- Early-G4 RomFS Start adapter (D020) --------------------------------
+#
+# A tiny AotProgHandler for ONLY the fs InitializeForApplication HOSTCALL. It
+# borrows an owning provider and an EXPLICIT config, calls the real provider
+# init at invocation time, publishes no guest Result and writes no guest state.
+# Plain C, not behind MN_BUILD_AOT_PROOF; no Python/LLVM/game data.
+add_library(g4_romfs_start_hle STATIC
+    tests/aot/g4_romfs_start_hle.c
+)
+target_include_directories(g4_romfs_start_hle PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/aot
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/aot
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(g4_romfs_start_hle PUBLIC romfs_provider)
+target_compile_options(g4_romfs_start_hle PRIVATE /W4 /WX)
+
+add_executable(g4_romfs_start_hle_probe
+    tests/aot/g4_romfs_start_hle_probe.c
+)
+target_link_libraries(g4_romfs_start_hle_probe PRIVATE g4_romfs_start_hle)
+target_compile_options(g4_romfs_start_hle_probe PRIVATE /W4 /WX)
+add_test(NAME g4_romfs_start_hle
+    COMMAND g4_romfs_start_hle_probe "${CMAKE_BINARY_DIR}")
+set_tests_properties(g4_romfs_start_hle PROPERTIES TIMEOUT 120)
+
+# Wrong-adapter controls: a void body that clobbers x0, and one that skips the
+# real provider init. Both must be rejected by the SAME probe with the exact
+# first failure named here, via the same strict native driver.
+set(G4_ROMFS_MUTANT_ARGS "")
+foreach(pair "SKIP_INIT|success reports one successful HOSTCALL"
+             "WRITE_X0|success writes no guest state")
+    string(REPLACE "|" ";" parts "${pair}")
+    list(GET parts 0 mut)
+    list(GET parts 1 label)
+    string(TOLOWER "${mut}" mut_lc)
+    add_executable(g4_romfs_start_hle_mut_${mut_lc}
+        tests/aot/g4_romfs_start_hle_probe.c
+        tests/aot/g4_romfs_start_hle.c
+        src/romfs_provider.c
+        src/romfs_file_win.c
+        src/aot/aot_sha256.c
+    )
+    target_include_directories(g4_romfs_start_hle_mut_${mut_lc} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/aot
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/aot
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(g4_romfs_start_hle_mut_${mut_lc} PRIVATE
+        MN_G4_ROMFS_MUT_${mut})
+    target_compile_options(g4_romfs_start_hle_mut_${mut_lc} PRIVATE /W4 /WX)
+    list(APPEND G4_ROMFS_MUTANT_ARGS
+        "$<TARGET_FILE:g4_romfs_start_hle_mut_${mut_lc}>" "${label}")
+endforeach()
+
+add_test(NAME g4_romfs_start_hle_mutants
+    COMMAND romfs_provider_mutant_driver "${CMAKE_BINARY_DIR}"
+        "$<TARGET_FILE:g4_romfs_start_hle_probe>"
+        ${G4_ROMFS_MUTANT_ARGS})
+set_tests_properties(g4_romfs_start_hle_mutants PROPERTIES TIMEOUT 180)
 
 enable_testing()
 
@@ -345,6 +482,253 @@ if(MN_BUILD_AOT_PROOF)
         "${CMAKE_SOURCE_DIR}/src/aot/aot_as.c"
         "${CMAKE_SOURCE_DIR}/src/aot/aot_program.c")
     set(AOT_FP_SRC "${CMAKE_SOURCE_DIR}/src/aot/aot_fp.c")
+
+    # Manual real-module probes are not linked by CMake: they need external
+    # flats and generated descriptors. Compile each as an object here so ABI
+    # mistakes (callback signatures, printf arguments) are caught by the
+    # regular /W4 /WX build instead of only by an external ad-hoc cl.exe run.
+    # Separate targets: both files define main(), so one OBJECT library would
+    # emit a duplicate-symbol linker warning.
+    foreach(_probe aot_g3_dtinit_probe aot_g3_start_probe)
+        add_library(${_probe}_compile OBJECT tests/aot/${_probe}.c)
+        target_include_directories(${_probe}_compile PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot"
+            "${CMAKE_SOURCE_DIR}/src")
+        target_compile_options(${_probe}_compile PRIVATE /W4 /WX)
+    endforeach()
+    add_library(aot_g3_start_hle_compile OBJECT tests/aot/g3_start_hle.c)
+    target_include_directories(aot_g3_start_hle_compile PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_compile PRIVATE /W4 /WX)
+
+    # Game-data-free native test of the minimal GetInfo(id 11) HLE.
+    add_executable(aot_g3_start_hle_probe
+        tests/aot/g3_start_hle_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_probe PRIVATE host_random host_vm)
+    add_test(NAME aot_g3_start_hle COMMAND aot_g3_start_hle_probe)
+
+    # Real address-space rows for GetInfo(4/5) and SetHeapSize SVC 0x01
+    # (host_vm_query witnesses the OS page state).
+    add_executable(aot_g3_start_hle_heap_probe
+        tests/aot/aot_g3_start_hle_heap_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_heap_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_heap_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_heap_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_start_hle_heap COMMAND aot_g3_start_hle_heap_probe)
+    set_tests_properties(aot_g3_start_hle_heap PROPERTIES TIMEOUT 120)
+
+    # Whole-domain SVC 0x06: mapped records, Free holes, upper Inaccessible
+    # extent, whole-span output faults and wrong-implementation controls.
+    add_executable(aot_g3_start_hle_query_probe
+        tests/aot/aot_g3_start_hle_query_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_query_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_query_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_query_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_start_hle_query COMMAND aot_g3_start_hle_query_probe)
+    set_tests_properties(aot_g3_start_hle_query PROPERTIES TIMEOUT 120)
+
+    add_executable(aot_as_query_domain_probe
+        tests/aot/aot_as_query_domain_probe.c ${AOT_CORE_SRC})
+    target_include_directories(aot_as_query_domain_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot" "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_as_query_domain_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_as_query_domain_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_as_query_domain COMMAND aot_as_query_domain_probe)
+
+    foreach(kind LOW_FROM_ADDR GAP_PAGE ABOVE_FREE)
+        string(TOLOWER "${kind}" lower_kind)
+        set(target "aot_as_domain_mut_${lower_kind}")
+        add_executable(${target} tests/aot/aot_as_query_domain_probe.c ${AOT_CORE_SRC})
+        target_include_directories(${target} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot" "${CMAKE_SOURCE_DIR}/src")
+        target_compile_options(${target} PRIVATE /W4 /WX)
+        target_compile_definitions(${target} PRIVATE "MN_AOT_DOMAIN_MUT_${kind}")
+        target_link_libraries(${target} PRIVATE host_vm)
+    endforeach()
+    foreach(kind PARTIAL_STORE MAPPED_ONLY)
+        string(TOLOWER "${kind}" lower_kind)
+        set(target "aot_g3_query_mut_${lower_kind}")
+        add_executable(${target} tests/aot/aot_g3_start_hle_query_probe.c
+            tests/aot/g3_start_hle.c ${AOT_CORE_SRC})
+        target_include_directories(${target} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot" "${CMAKE_SOURCE_DIR}/src")
+        target_compile_options(${target} PRIVATE /W4 /WX)
+        if(kind STREQUAL "PARTIAL_STORE")
+            target_compile_definitions(${target} PRIVATE MN_AOT_MUTANT_PARTIAL_STORE)
+        else()
+            target_compile_definitions(${target} PRIVATE MN_G3_QUERY_MUT_MAPPED_ONLY)
+        endif()
+        target_link_libraries(${target} PRIVATE host_vm)
+    endforeach()
+
+    # SVC 0x0c/0x25 thread HLE: real borrowed registry + deterministic fake,
+    # 32-bit handle truncation, pseudo alias, guest-id (not host TID) and
+    # wrong-implementation controls.
+    add_executable(aot_g3_start_hle_thread_probe
+        tests/aot/aot_g3_start_hle_thread_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_thread_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_thread_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_thread_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_start_hle_thread
+             COMMAND aot_g3_start_hle_thread_probe)
+    set_tests_properties(aot_g3_start_hle_thread PROPERTIES TIMEOUT 120)
+
+    # GetInfo 6/21 (pool) and 7/22 (image + logical heap + 0 alias) against
+    # the real AS heap, with grow/shrink/regrow and fail-closed budgets.
+    add_executable(aot_g3_start_hle_budget_probe
+        tests/aot/aot_g3_start_hle_budget_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_budget_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_budget_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_budget_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_start_hle_budget
+             COMMAND aot_g3_start_hle_budget_probe)
+    set_tests_properties(aot_g3_start_hle_budget PROPERTIES TIMEOUT 120)
+
+    # MapPhysicalMemory/UnmapPhysicalMemory (SVC 0x2c/0x2d) through the HLE and
+    # the address-space page state: exact Mac Result codes, register ABI, real
+    # host page state, QueryMemory runs and the GetInfo 7/22 alias term.
+    add_executable(aot_g3_start_hle_alias_probe
+        tests/aot/aot_g3_start_hle_alias_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_alias_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_alias_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_alias_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_start_hle_alias
+             COMMAND aot_g3_start_hle_alias_probe)
+    set_tests_properties(aot_g3_start_hle_alias PROPERTIES TIMEOUT 120)
+
+    # Mac HOST OVERRIDES reached from nn::init::Start (services.c:168-177).
+    # Game-data-free: the probe resolves the name table and calls the entry
+    # points directly, exactly like the Start-prefix registration driver does.
+    add_executable(aot_g3_start_hle_override_probe
+        tests/aot/aot_g3_start_hle_override_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_override_probe PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_override_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_override_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_start_hle_override
+             COMMAND aot_g3_start_hle_override_probe)
+    set_tests_properties(aot_g3_start_hle_override PROPERTIES TIMEOUT 120)
+
+    # Wrong-implementation controls for the host overrides: each must be
+    # rejected by aot_g3_start_hle_override_probe with the exact failure listed
+    # in tools/aot/g3_mutant_test.py. Not registered as passing tests.
+    foreach(mut OVERRIDE_X0 OVERRIDE_WRITE OVERRIDE_COUNT SKIP_BOOST_RANGE)
+        string(TOLOWER "${mut}" mut_lc)
+        add_executable(aot_g3_start_hle_mut_${mut_lc}
+            tests/aot/aot_g3_start_hle_override_probe.c
+            tests/aot/g3_start_hle.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_g3_start_hle_mut_${mut_lc} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot"
+            "${CMAKE_SOURCE_DIR}/src")
+        target_compile_options(aot_g3_start_hle_mut_${mut_lc} PRIVATE /W4 /WX)
+        target_link_libraries(aot_g3_start_hle_mut_${mut_lc} PRIVATE host_vm)
+        target_compile_definitions(aot_g3_start_hle_mut_${mut_lc} PRIVATE
+            MN_G3_HLE_MUT_${mut})
+    endforeach()
+
+    # Wrong-implementation controls for the alias SVC: each must be rejected by
+    # aot_g3_start_hle_alias_probe with the exact failure listed in
+    # tools/aot/g3_mutant_test.py. Not registered as passing tests.
+    foreach(mut ALIAS_LIMIT_CODE ALIAS_CLOBBER BUDGET_OMIT_ALIAS)
+        string(TOLOWER "${mut}" mut_lc)
+        add_executable(aot_g3_start_hle_mut_${mut_lc}
+            tests/aot/aot_g3_start_hle_alias_probe.c
+            tests/aot/g3_start_hle.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_g3_start_hle_mut_${mut_lc} PRIVATE
+            "${CMAKE_SOURCE_DIR}/src/aot"
+            "${CMAKE_SOURCE_DIR}/src")
+        target_compile_options(aot_g3_start_hle_mut_${mut_lc} PRIVATE /W4 /WX)
+        target_link_libraries(aot_g3_start_hle_mut_${mut_lc} PRIVATE host_vm)
+        target_compile_definitions(aot_g3_start_hle_mut_${mut_lc} PRIVATE
+            MN_G3_HLE_MUT_${mut})
+    endforeach()
+    add_executable(aot_g3_start_hle_mut_alias_no_unmap
+        tests/aot/aot_g3_start_hle_alias_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_mut_alias_no_unmap PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_mut_alias_no_unmap PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_mut_alias_no_unmap PRIVATE host_vm)
+    target_compile_definitions(aot_g3_start_hle_mut_alias_no_unmap PRIVATE
+        MN_G3_HLE_MUT_ALIAS_NO_UNMAP)
+
+    add_executable(aot_g3_start_hle_mut_sysres_const
+        tests/aot/g3_start_hle_probe.c tests/aot/g3_start_hle.c ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_mut_sysres_const PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot" "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_mut_sysres_const PRIVATE /W4 /WX)
+    target_compile_definitions(aot_g3_start_hle_mut_sysres_const PRIVATE
+        MN_G3_HLE_MUT_SYSRES_CONST)
+    target_link_libraries(aot_g3_start_hle_mut_sysres_const PRIVATE host_random host_vm)
+
+    # Wrong-implementation control: GetInfo(2/3) fake constants.
+    add_executable(aot_g3_start_hle_mut_info_const
+        tests/aot/aot_g3_start_hle_heap_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_mut_info_const PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_mut_info_const PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_mut_info_const PRIVATE host_vm)
+    target_compile_definitions(aot_g3_start_hle_mut_info_const PRIVATE
+        MN_G3_HLE_MUT_INFO_CONST)
+    # Wrong-implementation control: Info14/15 return the ALIAS geometry.
+    add_executable(aot_g3_start_hle_mut_info14_alias
+        tests/aot/aot_g3_start_hle_heap_probe.c
+        tests/aot/g3_start_hle.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_g3_start_hle_mut_info14_alias PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/aot"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_compile_options(aot_g3_start_hle_mut_info14_alias PRIVATE /W4 /WX)
+    target_link_libraries(aot_g3_start_hle_mut_info14_alias PRIVATE host_vm)
+    target_compile_definitions(aot_g3_start_hle_mut_info14_alias PRIVATE
+        MN_G3_HLE_MUT_INFO14_ALIAS)
+    add_test(NAME aot_g3_start_prefix_classification
+        COMMAND "${AOT_PYTHON}"
+            "${CMAKE_SOURCE_DIR}/tests/aot/g3_start_prefix_test.py")
+    add_test(NAME aot_g3_veneer_roots
+        COMMAND "${AOT_PYTHON}"
+            "${CMAKE_SOURCE_DIR}/tests/aot/g3_veneer_roots_test.py")
+    add_test(NAME aot_g4_romfs_config
+        COMMAND "${AOT_PYTHON}"
+            "${CMAKE_SOURCE_DIR}/tests/aot/g4_romfs_config_test.py")
+    set_tests_properties(aot_g4_romfs_config PROPERTIES TIMEOUT 120)
 
     set(AOT_FIXTURE_S   "${CMAKE_SOURCE_DIR}/tests/aot/fixture_arith.s")
     set(AOT_MANIFEST    "${CMAKE_SOURCE_DIR}/tests/aot/fixture_arith.manifest.json")
@@ -671,6 +1055,166 @@ if(MN_BUILD_AOT_PROOF)
     target_link_libraries(aot_as_probe PRIVATE host_vm)
     add_test(NAME aot_g3_as COMMAND aot_as_probe)
     set_tests_properties(aot_g3_as PROPERTIES TIMEOUT 120)
+
+    # G3 boot-heap window: the reviewed SetHeapSize transition contract, driven
+    # through the REAL public AS interface with host_vm_query as the independent
+    # OS witness. Fixture heap is 8 MiB (MAXSZ), so nothing commits 4 GiB.
+    add_executable(aot_as_heap_probe
+        tests/aot/aot_as_heap_probe.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_as_heap_probe
+        PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_as_heap_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_as_heap_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_as_heap COMMAND aot_as_heap_probe)
+    set_tests_properties(aot_g3_as_heap PROPERTIES TIMEOUT 120)
+
+    # Immutable AS-owned alias reserved window (64 GiB reserve-only).
+    add_executable(aot_as_alias_probe
+        tests/aot/aot_as_alias_probe.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_as_alias_probe
+        PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_as_alias_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_as_alias_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_as_alias COMMAND aot_as_alias_probe)
+    set_tests_properties(aot_g3_as_alias PROPERTIES TIMEOUT 120)
+
+    # Physical alias mapping (MapPhysicalMemory/UnmapPhysicalMemory): the
+    # guest-visible page state machine, budget, accounting and the OS-level
+    # host witness. Wrong-implementation controls live in
+    # tools/aot/g3_mutant_test.py; the fault seams are positive controls.
+    add_executable(aot_as_alias_map_probe
+        tests/aot/aot_as_alias_map_probe.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_as_alias_map_probe
+        PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_as_alias_map_probe PRIVATE /W4 /WX)
+    target_link_libraries(aot_as_alias_map_probe PRIVATE host_vm)
+    add_test(NAME aot_g3_as_alias_map COMMAND aot_as_alias_map_probe)
+    set_tests_properties(aot_g3_as_alias_map PROPERTIES TIMEOUT 180)
+
+    foreach(fault 1 2 3)
+        add_executable(aot_as_alias_fault_${fault}
+            tests/aot/aot_as_alias_map_probe.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_as_alias_fault_${fault}
+            PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_as_alias_fault_${fault} PRIVATE /W4 /WX)
+        target_link_libraries(aot_as_alias_fault_${fault} PRIVATE host_vm)
+        target_compile_definitions(aot_as_alias_fault_${fault}
+            PRIVATE MN_AOT_ALIAS_FAULT_MODE=${fault})
+        add_test(NAME aot_g3_as_alias_fault_${fault}
+            COMMAND aot_as_alias_fault_${fault})
+        set_tests_properties(aot_g3_as_alias_fault_${fault}
+            PROPERTIES TIMEOUT 180)
+    endforeach()
+
+    foreach(mut charge_all keep_stale keep_mapped query_no_run no_budget omit_usage)
+        string(TOUPPER "${mut}" mut_uc)
+        add_executable(aot_as_alias_map_mut_${mut}
+            tests/aot/aot_as_alias_map_probe.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_as_alias_map_mut_${mut}
+            PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_as_alias_map_mut_${mut} PRIVATE /W4 /WX)
+        target_link_libraries(aot_as_alias_map_mut_${mut} PRIVATE host_vm)
+        target_compile_definitions(aot_as_alias_map_mut_${mut}
+            PRIVATE MN_AOT_ALIAS_MUT_${mut_uc})
+    endforeach()
+
+    # Alias wrong-implementation controls (not passing tests).
+    foreach(mut query_state5 range_omit heap_selects keep_monitor_on_perm_fail)
+        add_executable(aot_as_alias_mut_${mut}
+            tests/aot/aot_as_alias_probe.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_as_alias_mut_${mut}
+            PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_as_alias_mut_${mut} PRIVATE /W4 /WX)
+        target_link_libraries(aot_as_alias_mut_${mut} PRIVATE host_vm)
+        if(mut STREQUAL "query_state5")
+            target_compile_definitions(aot_as_alias_mut_${mut}
+                PRIVATE MN_AOT_ALIAS_MUT_QUERY_STATE5)
+        elseif(mut STREQUAL "range_omit")
+            target_compile_definitions(aot_as_alias_mut_${mut}
+                PRIVATE MN_AOT_ALIAS_MUT_RANGE_OMIT)
+        elseif(mut STREQUAL "keep_monitor_on_perm_fail")
+            target_compile_definitions(aot_as_alias_mut_${mut}
+                PRIVATE MN_AOT_MEM_MUT_KEEP_MONITOR_ON_PERM_FAIL)
+        else()
+            target_compile_definitions(aot_as_alias_mut_${mut}
+                PRIVATE MN_AOT_ALIAS_MUT_HEAP_SELECTS)
+        endif()
+    endforeach()
+
+    # Deterministic host-refusal injection (private compile-time seam). Each of
+    # these is a POSITIVE control that must pass: it drives the failure and
+    # rollback protocol. Only the MN_AOT_HEAP_MUT_* executables below are
+    # negative controls (not registered as passing tests).
+    foreach(fault 1 2 3 4)
+        add_executable(aot_as_heap_fault_${fault}
+            tests/aot/aot_as_heap_probe.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_as_heap_fault_${fault}
+            PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_as_heap_fault_${fault} PRIVATE /W4 /WX)
+        target_link_libraries(aot_as_heap_fault_${fault} PRIVATE host_vm)
+        target_compile_definitions(aot_as_heap_fault_${fault}
+            PRIVATE MN_AOT_HEAP_FAULT_MODE=${fault})
+        add_test(NAME aot_g3_as_heap_fault_${fault}
+            COMMAND aot_as_heap_fault_${fault})
+        set_tests_properties(aot_g3_as_heap_fault_${fault}
+            PROPERTIES TIMEOUT 120)
+    endforeach()
+
+    # Wrong-implementation heap controls: each must be REJECTED by
+    # aot_as_heap_probe with a specific semantic failure (see
+    # tools/aot/g3_mutant_test.py). Not registered as passing tests.
+    set(AOT_G3_HEAP_MUTANTS shrink_decommit no_monitor_invalidate
+                              recommit_retained hw_as_used info5_size)
+    foreach(mut ${AOT_G3_HEAP_MUTANTS})
+        string(TOUPPER "${mut}" mut_uc)
+        add_executable(aot_as_heap_mut_${mut}
+            tests/aot/aot_as_heap_probe.c
+            ${AOT_CORE_SRC})
+        target_include_directories(aot_as_heap_mut_${mut}
+            PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+        target_compile_options(aot_as_heap_mut_${mut} PRIVATE /W4 /WX)
+        target_link_libraries(aot_as_heap_mut_${mut} PRIVATE host_vm)
+        target_compile_definitions(aot_as_heap_mut_${mut}
+            PRIVATE MN_AOT_HEAP_MUT_${mut_uc})
+    endforeach()
+    # Publish-before-host is only observable when a host call fails, so this
+    # control pairs the mutation with the shrink-failure injection.
+    add_executable(aot_as_heap_mut_publish_before_host
+        tests/aot/aot_as_heap_probe.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_as_heap_mut_publish_before_host
+        PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_as_heap_mut_publish_before_host PRIVATE /W4 /WX)
+    target_link_libraries(aot_as_heap_mut_publish_before_host PRIVATE host_vm)
+    target_compile_definitions(aot_as_heap_mut_publish_before_host PRIVATE
+        MN_AOT_HEAP_MUT_PUBLISH_BEFORE_HOST MN_AOT_HEAP_FAULT_MODE=4)
+    # Two guards on the shared production failure branch: they must be
+    # observable only with the matching injected host refusal.
+    add_executable(aot_as_heap_mut_no_desync
+        tests/aot/aot_as_heap_probe.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_as_heap_mut_no_desync
+        PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_as_heap_mut_no_desync PRIVATE /W4 /WX)
+    target_link_libraries(aot_as_heap_mut_no_desync PRIVATE host_vm)
+    target_compile_definitions(aot_as_heap_mut_no_desync PRIVATE
+        MN_AOT_HEAP_MUT_NO_DESYNC MN_AOT_HEAP_FAULT_MODE=3)
+    add_executable(aot_as_heap_mut_publish_on_commit_fail
+        tests/aot/aot_as_heap_probe.c
+        ${AOT_CORE_SRC})
+    target_include_directories(aot_as_heap_mut_publish_on_commit_fail
+        PRIVATE "${CMAKE_SOURCE_DIR}/src/aot")
+    target_compile_options(aot_as_heap_mut_publish_on_commit_fail PRIVATE /W4 /WX)
+    target_link_libraries(aot_as_heap_mut_publish_on_commit_fail PRIVATE host_vm)
+    target_compile_definitions(aot_as_heap_mut_publish_on_commit_fail PRIVATE
+        MN_AOT_HEAP_MUT_PUBLISH_ON_COMMIT_FAIL MN_AOT_HEAP_FAULT_MODE=1)
 
     add_executable(aot_program_probe
         tests/aot/aot_program_probe.c
@@ -1031,6 +1575,114 @@ if(MN_BUILD_AOT_PROOF)
                 "${CMAKE_SOURCE_DIR}/tests/aot/g3_decoder_module_test.py"
                 --tools "${CMAKE_SOURCE_DIR}/tools/aot")
     set_tests_properties(aot_g3_decoder_module PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # Bounded local-switch CFG edge prover + Phase-B module pipeline
+    # (lazy Context, site-local edges, final closure, codegen guard).
+    add_test(NAME aot_g3_local_switch
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_local_switch_test.py")
+    set_tests_properties(aot_g3_local_switch PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # D023 same-module DT_INIT_ARRAY constructor roots: hermetic synthetic
+    # fixtures (core derivation + prove + driver seam), no game data.
+    add_test(NAME aot_g3_ctor_roots
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_ctor_roots_test.py")
+    set_tests_properties(aot_g3_ctor_roots PROPERTIES TIMEOUT 120
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # D023 lazy root discovery through actual loader/AS/Program dispatch.
+    # Native misses supply the slot evidence; the guest walks both constructors.
+    add_test(NAME aot_g3_ctor_native
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_ctor_native_test.py"
+                --repo "${CMAKE_SOURCE_DIR}"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot"
+                --llvm "${AOT_LLVM_BIN_DIR}")
+    set_tests_properties(aot_g3_ctor_native PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # Native + Unicorn A57 differential of the emitted local-switch guard:
+    # compiles the ACTUAL generated C for four variants with MSVC /W4 /WX /O2
+    # in an external temp dir and direct-calls the translated basic blocks
+    # through the emitted AotBlockEntry table (dev probe; no game data).
+    add_test(NAME aot_g3_local_switch_native
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_local_switch_native_test.py"
+                --repo "${CMAKE_SOURCE_DIR}"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot")
+    set_tests_properties(aot_g3_local_switch_native PROPERTIES TIMEOUT 900
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # G3 DT_INIT reachability scanner: synthetic images, no game data.
+    add_test(NAME aot_g3_init_reach
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_init_reach_test.py"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot")
+    set_tests_properties(aot_g3_init_reach PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # Exhaustive SBFM/UBFM/BFM helper differential (every immr/imms geometry,
+    # both widths) against Unicorn A57; the C text is the translator's helper.
+    add_test(NAME aot_g3_bitfield_diff
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_bitfield_diff_test.py"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot")
+    set_tests_properties(aot_g3_bitfield_diff PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+    # Partial-AOT trap: structural metadata/edge checks + a NATIVE run of the
+    # emitted block (code 16, exact src/status, unchanged guest state) with
+    # compiled NOP and BAD_STATE generator mutants that must be rejected.
+    add_test(NAME aot_g3_partial
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_partial_test.py"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot")
+    set_tests_properties(aot_g3_partial PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    add_test(NAME aot_g3_partial_exec
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_partial_exec_test.py"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot"
+                --repo "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(aot_g3_partial_exec PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    # New integer/memory families: EMITTED-C blocks compiled and run natively
+    # vs Unicorn A57 (exact GPR/SP/NZCV/PC-after-branch/page), plus compiled
+    # translator mutants that must diverge.
+    add_test(NAME aot_g3_newfamily_diff
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_newfamily_diff_test.py"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot"
+                --repo "${CMAKE_SOURCE_DIR}"
+                --llvm "${AOT_LLVM_BIN_DIR}")
+    set_tests_properties(aot_g3_newfamily_diff PROPERTIES TIMEOUT 600
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    # Full CSEL/CSINC/CSINV/CSNEG condition x width x NZCV matrix on EMITTED C
+    # against Unicorn A57 (all 16 conditions and 16 NZCV nibbles per cell),
+    # ZR destinations and a compiled csel_cond mutant. LLVM paths come from the
+    # CMake cache discovery above, never a hardcoded developer directory.
+    add_test(NAME aot_g3_csel_matrix
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_csel_matrix_test.py"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot"
+                --repo "${CMAKE_SOURCE_DIR}"
+                --llvm "${AOT_LLVM_BIN_DIR}")
+    set_tests_properties(aot_g3_csel_matrix PROPERTIES TIMEOUT 900
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    # Module-only SIMD&FP MEMORY bit transfers (LDR/STR S/D/Q unsigned offset)
+    # on EMITTED C vs Unicorn A57: full raw V0..V31/FPCR/FPSR/page. Unicorn
+    # masks unsupported FPCR/FPSR bits, so the all-ones row is NATIVE-only and
+    # explicitly not a differential claim (G2 bitwise ABI policy).
+    add_test(NAME aot_g3_simd_ldst
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_simd_ldst_diff_test.py"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot"
+                --repo "${CMAKE_SOURCE_DIR}"
+                --llvm "${AOT_LLVM_BIN_DIR}")
+    set_tests_properties(aot_g3_simd_ldst PROPERTIES TIMEOUT 600
         ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
     add_test(NAME aot_g3_exec_mutants

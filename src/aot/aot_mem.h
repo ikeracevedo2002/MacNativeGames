@@ -60,13 +60,26 @@ typedef struct AotMemDomain AotMemDomain;
 
 typedef enum {
     AOT_MEM_OK = 0,
-    AOT_MEM_ERR_RANGE,   /* access outside every mapped range */
+    AOT_MEM_ERR_RANGE,   /* access outside every mapped range (legacy meaning
+                          * unchanged). Heap host refusals use the appended
+                          * AOT_MEM_ERR_HOST, never a renumbered value. */
     AOT_MEM_ERR_ALIGN,   /* caller demanded alignment and it was violated */
     AOT_MEM_ERR_WIDTH,   /* unsupported access width or invalid permission */
     /* The address is mapped but the page permission forbids the access
      * (a Program-mode guest address space only; the G2 arena never returns
      * it). Appended so every previous value is unchanged. */
-    AOT_MEM_ERR_PERM
+    AOT_MEM_ERR_PERM,
+    /* The host refused a completed guest-state operation (reserve/commit/
+     * decommit/protect) and the guest-visible state is unchanged, or the
+     * address space is fail-closed after an unrecoverable host rollback
+     * failure. Appended so every previous value is unchanged. */
+    AOT_MEM_ERR_HOST,
+    /* The request is well-formed and inside the window but exceeds the
+     * process resource pool (Mac APP_POOL LimitReached). Appended so every
+     * previous value is unchanged. This is a GUEST-visible refusal, not a
+     * host failure: the caller maps it to its own Result code (Mac
+     * services.c alias_map: 0x10801) and the guest state stays coherent. */
+    AOT_MEM_ERR_LIMIT
 } AotMemStatus;
 
 typedef struct AotAddressSpace AotAddressSpace;
@@ -127,6 +140,14 @@ AotMemStatus aot_mem_init_aspace(AotMem *m, AotAddressSpace *as);
  * other aot_mem_ / aot_as_ entry point that takes the lock. */
 void aot_mem_domain_lock(AotMemDomain *d);
 void aot_mem_domain_unlock(AotMemDomain *d);
+
+/* INTERNAL: disarm every exclusive reservation whose granule overlaps
+ * [addr, addr+n). The caller MUST already hold the domain lock (this primitive
+ * does not take it). It is the locked half of the public
+ * aot_mem_domain_invalidate_all() and is used by address-space transitions
+ * (e.g. a successful heap shrink) that run inside one critical section. */
+void aot_mem_domain_invalidate_range_locked(AotMemDomain *d, uint64_t addr,
+                                            uint64_t n);
 
 /* Bounds check only (no PERMISSION check). Arena mode: registered-arena
  * bounds, taken WITHOUT the domain lock (documented quiescent-use

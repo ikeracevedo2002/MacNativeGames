@@ -62,7 +62,14 @@ typedef enum {
     /* RESERVED, never produced in this increment: a guest thread-exit from a
      * nested (depth > 0) call is NOT modeled yet, and when the thread-exit ABI
      * lands it must fail closed with this code instead of unwinding a frame. */
-    AOT_FAULT_EXIT_IN_NESTED = 15u
+    AOT_FAULT_EXIT_IN_NESTED = 15u,
+    /* Partial-AOT image (-\-partial): the executed block reached a guest word
+     * the module subset cannot decode. fault_src is that instruction's PC and
+     * fault_status indexes the offline metadata table (raw word + decoder
+     * reason). Appended without renumbering, so the existing contract and
+     * AOT_STATE_LAYOUT/ABI version are unchanged. Never produced by a
+     * non-partial image and never a substitute for decoding at run time. */
+    AOT_FAULT_UNSUPPORTED_INSN = 16u
 } AotFault;
 
 typedef struct AotRuntime AotRuntime;

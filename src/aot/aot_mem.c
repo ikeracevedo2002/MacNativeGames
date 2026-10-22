@@ -160,7 +160,9 @@ static void mon_invalidate_locked(AotMemDomain *d, uint64_t addr, uint64_t n) {
     (void)n;
 #else
     uint64_t g0 = addr >> AOT_MEM_GRANULE_SHIFT;
-    /* (addr + n - 1) >> shift without a wrapping add: n is at most 16 bytes. */
+    /* (addr + n - 1) >> shift without a wrapping add. n is the caller's
+     * validated length (stores use <=16 bytes; a heap resize may pass a large
+     * retained range, and callers guarantee addr+n does not wrap). */
     uint64_t g1 = g0 +
         (((addr & (AOT_MEM_GRANULE_BYTES - 1ull)) + (n - 1u))
          >> AOT_MEM_GRANULE_SHIFT);
@@ -173,6 +175,12 @@ static void mon_invalidate_locked(AotMemDomain *d, uint64_t addr, uint64_t n) {
         if (g0 <= rg1 && rg0 <= g1) d->mon[i].size = 0;
     }
 #endif
+}
+
+void aot_mem_domain_invalidate_range_locked(AotMemDomain *d, uint64_t addr,
+                                            uint64_t n) {
+    /* mon_invalidate_locked expects the domain lock to be held. */
+    mon_invalidate_locked(d, addr, n);
 }
 
 /* ------------------------------------------------------------- arena ---- */
@@ -564,7 +572,14 @@ AotMemStatus aot_mem_stx(AotMem *m, uint32_t token, uint64_t addr,
          * failure of the permission/bounds pre-check, which must still consume
          * the local exclusive monitor exactly like the architectural STXR -
          * but keeps the runtime's attached monitor token alive. */
+#ifdef MN_AOT_MEM_MUT_KEEP_MONITOR_ON_PERM_FAIL
+        /* WRONG (controlled mutant): keep the reservation after a failed
+         * pre-check, so a later SC to the original address succeeds without
+         * a new LDXR. */
+        if (i >= 0 && s == AOT_MEM_OK) m->domain->mon[i].size = 0;
+#else
         if (i >= 0) m->domain->mon[i].size = 0;
+#endif
     }
     ReleaseSRWLockExclusive(&m->domain->lock);
     *status = st;
