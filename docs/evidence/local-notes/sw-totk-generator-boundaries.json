@@ -1,0 +1,29 @@
+{
+  "scope": "actual gen.Module.boundaries only; NOT full discover/fixpoint, emission, native compile or execution",
+  "modules": [
+    {
+      "module": "main",
+      "initial_generator_boundaries": 242863,
+      "ctor_slots": 10539,
+      "ctor_targets_in_initial_boundaries": 10539,
+      "first_ctor_present": true,
+      "elapsed_s": 0.732
+    },
+    {
+      "module": "subsdk0",
+      "initial_generator_boundaries": 10078,
+      "ctor_slots": 45,
+      "ctor_targets_in_initial_boundaries": 45,
+      "first_ctor_present": true,
+      "elapsed_s": 0.14
+    },
+    {
+      "module": "sdk",
+      "initial_generator_boundaries": 31282,
+      "ctor_slots": 116,
+      "ctor_targets_in_initial_boundaries": 116,
+      "first_ctor_present": true,
+      "elapsed_s": 0.249
+    }
+  ]
+}

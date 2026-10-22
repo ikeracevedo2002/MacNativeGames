@@ -128,6 +128,15 @@ the reference; a translated real slice runs main's PLT stub -> sdk
 real modules (D008) is not started; today 37.5% of the real exported
 functions are CFG-complete in the module-mode decoder.
 
+**Update 2026-10-22 (D018-D024):** the translator reaches far enough for the
+local Start-prefix driver to run the SDK side of `nn::init::Start` and the
+original main constructor loop translated, with roots admitted only by the
+narrow D021 (veneer), D022 (local switch edges) and D023 (same-module
+DT_INIT_ARRAY slot) proofs. D024 adds an offline FDE frontend and a candidate
+catalog: function bodies may be compiled ahead of time, but the dispatch table
+(`AotImage`) still lists only the closure of admitted roots, so compiled is not
+authorized. Current state and next steps: `docs/PROJECT_STATE.md`.
+
 ### Memory model
 
 The Mac implementation assumes relationships between guest virtual addresses, CPU pointers and GPU addresses.

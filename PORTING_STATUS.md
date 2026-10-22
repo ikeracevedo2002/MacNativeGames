@@ -23,11 +23,11 @@ Do not mark a row VALIDATED because it compiles. Add evidence that satisfies the
 | AOT FP/SIMD | VALIDATED (scoped G2 controlled proof) | Numeric FP: F32/F64 `fadd`/`fsub`/`fmul`/`fdiv`/`fcmp`/`fcmpe` over RN/RP/RM/RZ × DN × FZ with sticky FPSR — 2304 differential matrix cells inside the 3049 oracle cases, 45 closed-form helper rows, 10 translated closed-form rows, and **392 native-only unsupported-FPCR faults + 3 bitwise low-32 ABI rows** counted separately (the oracle masks unsupported FPCR bits). Unsupported numeric modes fault before any destination/FPSR write (`AOT_FAULT_BAD_STATE` / `AOT_FP_ERR_UNSUPPORTED_FPCR`). Bitwise `fmov`/`fabs`/`fneg` are unmasked by the numeric guard; vector `.16B` `and`/`orr`/`eor`/`add`/`sub` (SWAR). **No FP16/FMA/sqrt/FP-conversion/full SIMD.** |
 | AOT atomics/order | VALIDATED (scoped serialized-SC proof model) | `ldxr`/`stxr` B/H/W/X and `ldar`/`stlr` B/H/W/X differential; `ldaxr`/`stlxr` X pair end-to-end (decoder/lowering all widths, not all fixtures). One domain-wide lock serializes every access (SC, deliberately stronger than the guest's weak model); 64-byte proof granule invalidation incl. same-value/ABA, exact address+width STXR match, per-runtime monitor token, HLE-boundary conservative local clear. The oracle is **value-based** for exclusives, so same-value/ABA is pinned by independent architectural reasoning plus locked **C-race-free wrong-backend controls** (no live-thread mutants); that is a known value-based monitor limitation of the oracle model, not a claim about upstream bugs. Barrier dropping is not a valid mutant under SC. **No weak/TSO-style backend, no alias domains.** |
 | Guest/HLE x64 ABI | VALIDATED (scoped G2 controlled proof) | `AotGuestState` (816 B, 8-byte aligned, unchanged layout; subset id `g2-core-v2`) round-trips through native block entries and a registered typed native HLE handler (`void`, state effects, fixed resume). Release detaches every borrowed pointer without freeing caller-owned state/image; a live runtime is single-owner with no concurrent run/release. Host->guest callbacks/reentry not supported in the G2 ABI-v1 path; for ABI-v2 Program images see D015/D016 (G3). See D010/D012. |
-| Translated module loader | IN PROGRESS (loader/linker VALIDATED; full-module translation not started) | main/sdk/subsdk0 translated images map/link. Evidence (G3, `docs/g3-module-loader.md`): explicit guest address space + 3 regions per module with Horizon permissions; exact-version verification (flat SHA-256 + pinned layout) before any region; RELA/JMPREL/RELR, kinds 257/1025/1026/1027, Mac resolution order, override/observer thunks, weak/strong rules, independent-reference link digest (D017). Fixture modules (ld.lld, 4 variants) byte-identical to the Python reference and an llvm-readelf checker, 16 negative images, 11 loader mutants. Locally (opt-in `MN_TOTK_V0_DIR`) the real TotK 1.0.0 main/subsdk0/sdk link with 558,865 sites byte-identical to the reference, digest match, 0 unresolved strong imports, relocate 74 ms. Limitation: only a real slice is translated (main's `GetSystemTick` PLT stub, sdk's `GetSystemTick`; subsdk0 link-only); coverage today is 37.5% of the 32,979 exported functions. |
-| Module init/callbacks | VALIDATED (translated fixture modules; real constructors pending full-module translation) | Constructors and host callbacks execute correctly. Evidence: `aot_g3_exec` runs an nn::init::Start-shaped flow as translated code (host -> sdk_start -> loader_ready/module_inits thunks -> nested DT_INIT of main, sub, sdk -> init_array walked by the guest -> constructors calling across modules), exact global order and exactly-once, finalizers never called; HLE->guest and translated->translated callbacks; INIT_ARRAY_WALK mutant rejected. Real 1.0.0 DT_INIT bodies are not executed (they need full-module translation). |
-| Core Horizon services | NOT STARTED | Headless boot checkpoint on Windows |
-| RomFS/filesystem/save | NOT STARTED | Native Windows probes pass |
-| Graphics backend decision | RESEARCH | Vulkan vs D3D12 spike recorded in DECISIONS.md |
+| Translated module loader | IN PROGRESS (loader/linker VALIDATED; full-module translation not started) | main/sdk/subsdk0 translated images map/link. Evidence (G3, `docs/g3-module-loader.md`): explicit guest address space + 3 regions per module with Horizon permissions; exact-version verification (flat SHA-256 + pinned layout) before any region; RELA/JMPREL/RELR, kinds 257/1025/1026/1027, Mac resolution order, override/observer thunks, weak/strong rules, independent-reference link digest (D017). Fixture modules (ld.lld, 4 variants) byte-identical to the Python reference and an llvm-readelf checker, 16 negative images, 11 loader mutants. Locally (opt-in `MN_TOTK_V0_DIR`) the real TotK 1.0.0 main/subsdk0/sdk link with 558,865 sites byte-identical to the reference, digest match, 0 unresolved strong imports, relocate 74 ms. Limitation: only a real slice is translated (main's `GetSystemTick` PLT stub, sdk's `GetSystemTick`; subsdk0 link-only); coverage today is 37.5% of the 32,979 exported functions. **2026-10-22:** the translator now covers enough of the real modules for the local Start-prefix driver (`tools/aot/g3_start_prefix.py`) to run the whole SDK side of `nn::init::Start` translated (D018–D023, `be2aff7`). Full-module translation is still not done; D024 Stage A/B (`g3_fde_frontend.py`, `g3_fde_emit.py`) prepare FDE-based ahead-of-time catalogs that stay non-dispatchable until admitted. |
+| Module init/callbacks | VALIDATED (translated fixture modules; real constructors pending full-module translation) | Constructors and host callbacks execute correctly. Evidence: `aot_g3_exec` runs an nn::init::Start-shaped flow as translated code (host -> sdk_start -> loader_ready/module_inits thunks -> nested DT_INIT of main, sub, sdk -> init_array walked by the guest -> constructors calling across modules), exact global order and exactly-once, finalizers never called; HLE->guest and translated->translated callbacks; INIT_ARRAY_WALK mutant rejected. Real 1.0.0 DT_INIT bodies are not executed (they need full-module translation). **2026-10-22 (local, opt-in):** sdk `__nnmusl_init_dso` runs translated; main DT_INIT runs its original constructor loop and 22 of 10,539 main constructors were admitted by D023 proofs and returned before the run's 24-iteration budget. Each admission currently needs a full re-translation/rebuild (D024 Stage C target). |
+| Core Horizon services | NOT STARTED (G3 prerequisites only) | Headless boot checkpoint on Windows. Not a G4 start: only the address-space services Start needs exist (SetHeapSize/GetInfo/QueryMemory/alias map, D018/D019, see the AS row); no IPC/service dispatch. SavageWind's HIPC/CMIF/TIPC code is study material (D024). |
+| RomFS/filesystem/save | IN PROGRESS (read-only RomFS provider validated early, D020; save path not started) | Native Windows probes pass. Evidence: `src/romfs_provider.{h,c}` + `src/romfs_file_win.{h,c}`, `docs/romfs-provider.md`, `romfs_provider`, `romfs_provider_mutants`, `g4_romfs_start_hle(_mutants)`, `aot_g4_romfs_config`; real 1.0.0 RomFS reaches READY with 304,207 files in the local Start run. No IPC FS service, saves or overlays. |
+| Graphics backend decision | RESEARCH | Vulkan vs D3D12 spike recorded in DECISIONS.md. D024: Vulkan is the first spike candidate (SavageWind NVN 55.15/Vulkan/Maxwell code as study material; TotK guard requires NVN major 55, minor >= 15). Not started; D007 open. |
 | NVN device/sync/memory | NOT STARTED | Backend probes for queues, pools, fences pass |
 | NVN textures/rendering | NOT STARTED | Clear + textured minimal draw passes |
 | Shader translator win-x64 | NOT STARTED | NativeAOT service runs and deterministic fixtures match |
@@ -112,25 +112,30 @@ coupling found during G3 were fixed at the source.
 
 ## Current blockers
 
-1. **G3 closure:** full-module translation of main/subsdk0/sdk (remaining A64
-   integer/memory/SIMD/FP forms, indirect-target and code/data discovery) so
-   the real modules can be fully translated and their DT_INIT constructors
-   run. This is the D008 backend decision plus translator coverage; first
-   blocking forms on the real code are `tbz/tbnz`, shifted-register `and`,
-   `stp/str/ldur/stur` variants, `mov` aliases and `csel`.
-2. A host VEH/SEH fault policy is still not implemented (guest faults are
+1. **G3 closure (constructors):** the real main init_array has 10,539 entries
+   (subsdk0 45, sdk 116). D023 admits each reached constructor safely, but every
+   admission currently costs a full re-translation of three modules, an MSVC
+   rebuild and a Start rerun. The last local run returned 22 main constructors
+   before its 24-iteration budget, and no new semantic blocker appeared. What
+   comes after the constructors is unknown.
+2. **Full-module translation / D008:** still open. D024 makes C generation
+   driven by the FDE frontend the prioritized experiment (Stage C measures it).
+3. A host VEH/SEH fault policy is still not implemented (guest faults are
    typed software faults and do not need it today).
-3. Windows graphics backend is not selected or implemented (D007 open).
+4. Windows graphics backend is not selected or implemented (D007 open).
 
 ## Next recommended work
 
-1. G3 stays OPEN with its exit condition unchanged (user decision): the
-   loader/linking part is a completed component of G3, not a closed gate.
-   Next objective: remove the remaining G3 blocker by translating enough of the
-   real main/subsdk0/sdk modules to run their translated DT_INIT constructors
-   (D008 evidence and first blocking forms: `docs/g3-module-loader.md` coverage
-   section).
-2. Keep real-module validation local and opt-in (`MN_TOTK_V0_DIR`); never
-   commit game-derived artifacts.
-3. G4 (headless Horizon) remains out of scope until G3 is closed.
-4. Keep the Apple/ARM64 dependency inventory current as work proceeds.
+1. **D024 Stage C:** a real-exec harness that links a Stage B catalog plus
+   table build; then make `g3_start_prefix.py` precompile a stratified batch
+   of about 32 constructors/callees as catalog bodies, so that an admission
+   regenerates only the table TU. Measure parse/emit/compile/link time, size,
+   unsupported instructions and rebuilds avoided. The guest loop, its guards
+   and the D023 proof per root stay mandatory.
+2. Decide D008 from that measurement; then continue the constructor run to
+   completion and record the next blocker.
+3. Keep real-module validation local and opt-in (`MN_TOTK_V0_DIR`,
+   `MN_TOTK_ROOTS_DIR`); never commit game-derived artifacts.
+4. G4 general work and the G5 spike stay out of scope until G3 is closed,
+   except work that directly removes a G3 blocker (as D020 did).
+5. Full handoff, test counts and code map: `docs/PROJECT_STATE.md`.

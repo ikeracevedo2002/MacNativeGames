@@ -11,7 +11,11 @@ Read, in order:
 3. `ARCHITECTURE.md`
 4. `PORTING_PLAN.md`
 5. `PORTING_STATUS.md`
-6. the Mac source files for the subsystem being changed
+6. `docs/PROJECT_STATE.md` (current state, test counts, code map, next step)
+7. the Mac source files for the subsystem being changed
+
+Background material: `docs/research/` (e.g. the SavageWind audit behind D024) and
+`docs/evidence/` (imported lab notes; history, not authority).
 
 Do not start a broad rewrite before identifying the exact Mac behavior that must be preserved.
 

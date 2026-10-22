@@ -1,0 +1,29 @@
+{
+  "scope": "READONLY metadata compatibility, NOT proof of codegen or execution",
+  "constructors": [
+    {
+      "module": "main",
+      "slots": 10539,
+      "discovered": 10539,
+      "exact_fde_starts": 10539,
+      "missing_count": 0,
+      "without_exact_fde_count": 0
+    },
+    {
+      "module": "subsdk0",
+      "slots": 45,
+      "discovered": 45,
+      "exact_fde_starts": 45,
+      "missing_count": 0,
+      "without_exact_fde_count": 0
+    },
+    {
+      "module": "sdk",
+      "slots": 116,
+      "discovered": 116,
+      "exact_fde_starts": 116,
+      "missing_count": 0,
+      "without_exact_fde_count": 0
+    }
+  ]
+}

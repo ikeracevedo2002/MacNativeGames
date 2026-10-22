@@ -1,0 +1,20 @@
+[
+  {
+    "module": "main",
+    "structural_array_valid": true,
+    "slots": 10539,
+    "scope": "No runtime cursor proof or root activation"
+  },
+  {
+    "module": "subsdk0",
+    "structural_array_valid": true,
+    "slots": 45,
+    "scope": "No runtime cursor proof or root activation"
+  },
+  {
+    "module": "sdk",
+    "structural_array_valid": true,
+    "slots": 116,
+    "scope": "No runtime cursor proof or root activation"
+  }
+]

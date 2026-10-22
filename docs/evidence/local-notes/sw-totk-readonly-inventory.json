@@ -1,0 +1,107 @@
+{
+  "savagewind_commit": "575ad88e02f9a89a9a885d90039d48af33c982f4",
+  "scope": "READ_ONLY parsing/discovery only; no generated code or game execution",
+  "modules": [
+    {
+      "name": "main",
+      "nso_sha256": "faf81f8a609ff61a6322d04948132b5929af9f6e2398e0e0ebbe819b8ba3eaab",
+      "image_size": 73818112,
+      "text": [
+        0,
+        44722704
+      ],
+      "symbols": 704,
+      "relocations": {
+        "1027": 502345,
+        "1025": 32,
+        "257": 1419,
+        "1026": 640
+      },
+      "discovery_count": 243446,
+      "sources": {
+        "eh": 242860,
+        "ptr": 3,
+        "bl": 583
+      },
+      "fde_extents": 242860,
+      "dt_init": 48,
+      "init_array": 72788840,
+      "init_array_bytes": 84312,
+      "first_ctor_addend": 5408,
+      "first_ctor_discovery_source": "eh",
+      "first_ctor_fde_extent": [
+        5408,
+        5508
+      ],
+      "elapsed_s": 1.243
+    },
+    {
+      "name": "subsdk0",
+      "nso_sha256": "9d04c98997977e99c12a48a2dbfd3064b8da96b5152e0119064957a43f6c3f99",
+      "image_size": 6983680,
+      "text": [
+        0,
+        3424448
+      ],
+      "symbols": 11622,
+      "relocations": {
+        "1027": 1623,
+        "1025": 1030,
+        "257": 12820,
+        "1026": 3924
+      },
+      "discovery_count": 13690,
+      "sources": {
+        "eh": 10061,
+        "sym": 15,
+        "ptr": 2,
+        "bl": 3612
+      },
+      "fde_extents": 10061,
+      "dt_init": 48,
+      "init_array": 5829224,
+      "init_array_bytes": 360,
+      "first_ctor_addend": 1792,
+      "first_ctor_discovery_source": "eh",
+      "first_ctor_fde_extent": [
+        1792,
+        1824
+      ],
+      "elapsed_s": 0.167
+    },
+    {
+      "name": "sdk",
+      "nso_sha256": "91573d4444d0dcd07080db78fece2b098b76080d77cdb2e1d301a2a41d7c4eea",
+      "image_size": 14520320,
+      "text": [
+        0,
+        6161120
+      ],
+      "symbols": 27761,
+      "relocations": {
+        "1027": 10917,
+        "1025": 1207,
+        "257": 13976,
+        "1026": 8932
+      },
+      "discovery_count": 38305,
+      "sources": {
+        "eh": 31238,
+        "sym": 36,
+        "ptr": 8,
+        "bl": 7023
+      },
+      "fde_extents": 31238,
+      "dt_init": 48,
+      "init_array": 13739608,
+      "init_array_bytes": 928,
+      "first_ctor_addend": 6011312,
+      "first_ctor_discovery_source": "eh",
+      "first_ctor_fde_extent": [
+        6011312,
+        6011328
+      ],
+      "elapsed_s": 0.173
+    }
+  ]
+}
