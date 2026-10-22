@@ -56,6 +56,18 @@ Tasks:
 
 Do not integrate graphics yet beyond stubs necessary for boot.
 
+Constructor progress (D024): run the frontend/build experiment before adding any new root heuristic.
+
+1. Stage A: adapted NSO/FDE frontend producing a candidate manifest with module hash and per-boundary
+   provenance; typed fail-closed parsing; known-DATA preserved; no execution change.
+2. Stage B: emit main constructor `0x1520` and the validated SDK local switch through that frontend
+   against our ABI/Program/memory; compare GPR/SP/NZCV/FPCR/FPSR, transfers and writes with the current
+   translator; negatives for wrong boundary, RO/OOB, misaligned SP, altered return, exclusives ABA/size
+   and compiled-but-unadmitted target.
+3. Stage C, only if B preserves every contract: a stratified batch of about 32 constructors/callees,
+   measuring parse/emit/compile/link time, size, unsupported instructions and rebuilds avoided per
+   newly reached constructor.
+
 Exit condition: G3.
 
 ## Phase 3 — Horizon/runtime bring-up
@@ -72,6 +84,10 @@ Port platform dependencies in this order:
 6. account/settings/applet essentials.
 
 Keep shared service semantics intact and replace only host mechanisms.
+
+SavageWind's HIPC/CMIF/TIPC codec and service command maps are study/adaptation material (D024): bound
+every count and descriptor against our guest memory, implement only commands actually reached, and fail
+unknown commands explicitly. Keep the existing RomFS provider.
 
 Exit condition: G4.
 
@@ -93,6 +109,12 @@ Suggested order:
 10. presentation and cache warm-up.
 
 Port existing GPU probes where possible. Preserve the timing/lifetime lessons encoded in the Metal backend instead of copying its API shape.
+
+Before implementation, the D007 spike starts with Vulkan and NVN compatibility probing (D024): real
+`nvnDeviceGetInteger` values, resolved entry-point inventory, object sizes/offsets with canaries, format and
+swizzle vectors, shader corpus per stage compared against both Maxwell->SPIR-V and Maxwell->GLSL routes, and
+sync/alias/coherence negatives. Do not start this while an earlier gate is blocked unless it removes that
+blocker.
 
 Exit condition: G5.
 

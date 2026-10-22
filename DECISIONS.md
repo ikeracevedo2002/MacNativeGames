@@ -374,3 +374,49 @@ the real 1.0.0 set a global-first order would change 1,112 symbolic sites over 1
 finalizers are not modeled; Mac game patches must become explicit translation-time overrides (OPEN). Entry
 discovery treats link values that land in text as code entries; a data object placed in text and referenced
 by address makes translation fail closed (code/data distinction for full-module translation is OPEN).
+
+## D024 — Partial pivot to SavageWind-style module frontend and build; keep our runtime
+
+**Status:** Accepted (direction). D007 and D008 remain Open.
+
+Numbering note: D018–D023 are drafted in the unintegrated G3 candidate (worktree `w21-2`); this entry
+is numbered after them so the two can be merged without renumbering.
+
+Source: `docs/research/savagewind-audit.md`, pinned to SavageWindRecomp `575ad88e02f9a89a9a885d90039d48af33c982f4`.
+
+Decision:
+
+- **Adapt** (after hardening and tests): NSO/FDE metadata frontend with typed fail-closed parsing and
+  per-boundary provenance; per-module generation organized in chunks with explicit build identity; the
+  synthetic-NSO fixture builder; pure lifter operations only after differential equivalence and negatives.
+- **Keep ours**: 816-byte guest-state ABI (D010), immutable Program and guest-VA transfers (D015), nested
+  host->guest calls (D016), the validated loader (D017), guest address space and page permissions (D014),
+  typed/sticky faults, the exclusive monitor with domain invalidation and FP/FPSR semantics (D012/D013),
+  and the immutable RomFS provider.
+- **Do not copy**: guest==host address identity or autocommit, host pointers stored in guest objects,
+  exclusives implemented as value CAS, guest RET lowered to a plain C return, the all-labels BR fallback
+  as control-flow authority, success replies for unknown HLE/IPC commands, saves without
+  containment/commit, and BOTW-specific version, frame-loop or GPU approximations.
+- **Compiled is not authorized.** A function body may be generated or compiled ahead of time, but the set of
+  executable entries stays the CFG closure of roots admitted by the current root policy. Executing a
+  compiled-but-unadmitted target must produce exactly the same typed result as today. FDE starts are
+  evidence for boundaries, not roots; no BL/ADR/RELATIVE scan becomes an entry point by itself.
+- No SavageWind code under GPL (Unicorn, the `swgen` helper) enters the runtime or the tree; reused MIT code
+  keeps its SavageWind/LAS notices.
+
+Effect on open decisions:
+
+- D008: the concrete prioritized experiment is C generation driven by the adapted frontend, emitted against
+  our ABI/memory/control model. SavageWind's BOTW build times and performance do not predict cost under our
+  guarantees; D008 is closed only after that measurement.
+- D007: Vulkan is the first backend to spike, using SavageWind's NVN 55.15/Vulkan/Maxwell code as study
+  material. TotK's NVN guard (major == 55, minor >= 15) is compatible with 55.15; object layouts, entry-point
+  corpus, synchronization and shader coverage are unverified, so D007 stays open.
+
+Evidence (offline, local): SavageWind's tools parse our 1.0.0 main/subsdk0/sdk; all 10,700 DT_INIT_ARRAY
+targets coincide with FDE starts and are present in `gen.Module.boundaries()`; our structural constructor
+validator accepts all three tables. This proves metadata compatibility only, not lifter coverage,
+equivalent ABI, init order or execution.
+
+Consequences: G3 constructor progress is pursued by the frontend/build experiment (PORTING_PLAN Phase 2)
+before any new root heuristic. No exit condition changes.
