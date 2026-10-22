@@ -1593,6 +1593,19 @@ if(MN_BUILD_AOT_PROOF)
     set_tests_properties(aot_g3_ctor_roots PROPERTIES TIMEOUT 120
         ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
+    # D024 Stage A: NSO/FDE metadata frontend producing a CANDIDATE boundary
+    # manifest. The fixture is a real llvm-mc/ld.lld --eh-frame-hdr module
+    # (tests/aot/g3/fde_fixture.s + fde.ld) flattened by aot_module.elf2flat;
+    # no game data. The suite also runs its own assertions in a child process
+    # against a deliberately lax frontend (monkeypatched in that child only),
+    # which must FAIL: a mutant that passes is a survivor.
+    add_test(NAME aot_g3_fde_frontend
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_fde_frontend_test.py"
+                --llvm "${AOT_LLVM_BIN_DIR}")
+    set_tests_properties(aot_g3_fde_frontend PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
     # D023 lazy root discovery through actual loader/AS/Program dispatch.
     # Native misses supply the slot evidence; the guest walks both constructors.
     add_test(NAME aot_g3_ctor_native
@@ -1910,6 +1923,18 @@ if(MN_BUILD_AOT_PROOF)
                     --v0-dir "${MN_TOTK_V0_DIR}"
                     --work "${CMAKE_CURRENT_BINARY_DIR}/aot_gen/real")
         set_tests_properties(aot_g3_real_link PROPERTIES TIMEOUT 900
+            ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+        # D024 Stage A on the real modules: parse each flat fail-closed through
+        # MOD0 -> .eh_frame_hdr, write the candidate manifests under the BUILD
+        # dir and assert that every D023-derived DT_INIT_ARRAY target is an FDE
+        # start. Nothing it produces may reach the source tree.
+        add_test(NAME aot_g3_fde_frontend_real
+            COMMAND "${AOT_PYTHON}"
+                    "${CMAKE_SOURCE_DIR}/tests/aot/g3_fde_frontend_real_test.py"
+                    --v0-dir "${MN_TOTK_V0_DIR}"
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/aot_gen/fde_frontend")
+        set_tests_properties(aot_g3_fde_frontend_real PROPERTIES TIMEOUT 900
             ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
         # ---- Item D: execute the translated real slice ------------------

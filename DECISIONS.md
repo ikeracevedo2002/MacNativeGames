@@ -1007,5 +1007,13 @@ targets coincide with FDE starts and are present in `gen.Module.boundaries()`; o
 validator accepts all three tables. This proves metadata compatibility only, not lifter coverage,
 equivalent ABI, init order or execution.
 
+Stage A evidence: our own fail-closed frontend `tools/aot/g3_fde_frontend.py` (written from the
+.eh_frame specification, no SavageWind code) emits `authority: none` candidate manifests. Its hdr table and
+linear walk agree exactly on 1.0.0: 242,860 / 10,061 / 31,238 FDEs, 0 known-DATA conflicts, and
+10,700/10,700 D023-derived constructor targets on an FDE start (`aot_g3_fde_frontend_real`, opt-in). All real
+CIEs use pcrel|sdata4, the only accepted FDE pointer encoding. Synthetic suite `aot_g3_fde_frontend`: typed
+refusals for 16 malformed inputs, D006 output guard incl. case-changed and junction paths, two lax mutants
+caught. Nothing consumes the manifest yet.
+
 Consequences: G3 constructor progress is pursued by the frontend/build experiment (PORTING_PLAN Phase 2)
 before any new root heuristic. No exit condition changes.
