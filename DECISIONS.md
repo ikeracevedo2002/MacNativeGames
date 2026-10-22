@@ -1015,5 +1015,23 @@ CIEs use pcrel|sdata4, the only accepted FDE pointer encoding. Synthetic suite `
 refusals for 16 malformed inputs, D006 output guard incl. case-changed and junction paths, two lax mutants
 caught. Nothing consumes the manifest yet.
 
+Stage B evidence (offline; no runtime, loader, Program or AotImage change): `tools/aot/g3_fde_emit.py`
+builds a non-dispatchable catalog of FDE-window bodies (function-local CFG via the opt-in `restrict` of
+`build_cfg`/`module_cfg`, our own `emit_insn`) and an authority step whose AotImage lists only the closure
+of the admitted roots. Every closure block inside a window must match a catalog block exactly (start, end,
+words, D022 target set from the admitted-graph proof), otherwise it fails closed. Candidate bodies use
+disjoint status namespaces; equivalence is (fault kind, source PC, resolved PC). Hermetic
+`aot_g3_fde_emit` (99 checks): through the real loader/AS/Program, the catalog+table build equals today's
+build field by field for normal paths, STR to RO, RO->RW straddle, exclusive ABA and size mismatch,
+unsupported word, and a BLR to a compiled-but-unadmitted body (`UNTRANSLATED`, body linked,
+`aot_program_lookup` NULL). Unicorn is a third oracle where it models the path. A wrong authority step that
+lists out-of-closure bodies is caught. Real 1.0.0 (`aot_g3_fde_emit_real`, opt-in) with the Start-prefix
+roots (main 27, sdk 213): main `0x1520` 4/4 blocks and sdk `__nnmusl_init_dso` 173/173 blocks match, with 0
+mismatches. The D022 switch `0x102008db10` has the same 6 unique targets in the catalog and the admitted
+proof. The AotImage equals today's 338 / 3,431 closure starts. With `restrict` unused, the translator
+output for those closures is byte-identical to the previous translator except the provenance hash line.
+Not executed on real data: no existing real-exec harness accepts a catalog+table pair. No timing claim
+(Stage C).
+
 Consequences: G3 constructor progress is pursued by the frontend/build experiment (PORTING_PLAN Phase 2)
 before any new root heuristic. No exit condition changes.

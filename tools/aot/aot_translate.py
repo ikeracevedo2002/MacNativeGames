@@ -1300,7 +1300,7 @@ def validate_thunks(thunks, ranges):
 # ---------------------------------------------------------------- CFG
 
 def build_cfg(raw, ranges, entries, indirect_targets, base=0, module=False,
-              local_edges=None):
+              local_edges=None, restrict=None):
     """Recover the reachable CFG.
 
     `ranges` and the entry/target PCs are GUEST virtual addresses; `base` is
@@ -1318,6 +1318,12 @@ def build_cfg(raw, ranges, entries, indirect_targets, base=0, module=False,
     exactly like a direct branch, so a target that is already visited still
     becomes a new basic-block start (split). The default `None` leaves the
     legacy G2 path byte-identical.
+
+    `restrict` is an opt-in (lo, hi) guest-VA window for the D024 Stage B
+    candidate catalog (function-local CFG over one FDE boundary). Every entry
+    must lie inside it; a successor outside it ends the block and is NOT
+    followed (it is still validated against `ranges` exactly as before), and
+    straight-line decoding stops at `hi`. The default `None` is today's walk.
     """
     for i, (s, e) in enumerate(ranges):
         if s >= e:
@@ -1339,6 +1345,18 @@ def build_cfg(raw, ranges, entries, indirect_targets, base=0, module=False,
             raise DecodeError("entry/target not 4-aligned: 0x%x" % pc)
         if not in_ranges(ranges, pc):
             raise DecodeError("entry/target outside declared ranges: 0x%x" % pc)
+    if restrict is not None:
+        r_lo, r_hi = restrict
+        if (r_lo >= r_hi or r_lo % 4 or r_hi % 4
+                or not in_ranges(ranges, r_lo)
+                or not in_ranges(ranges, r_hi - 4)):
+            raise DecodeError("restrict window [0x%x,0x%x) is not an aligned "
+                              "window inside the declared ranges"
+                              % (r_lo, r_hi))
+        for pc in starts:
+            if not r_lo <= pc < r_hi:
+                raise DecodeError("entry 0x%x is outside the restrict window "
+                                  "[0x%x,0x%x)" % (pc, r_lo, r_hi))
 
     visited = {}
     work = list(starts)
@@ -1347,6 +1365,8 @@ def build_cfg(raw, ranges, entries, indirect_targets, base=0, module=False,
         cur = pc
         while True:
             if cur in visited:
+                break
+            if restrict is not None and not r_lo <= cur < r_hi:
                 break
             if cur % 4 != 0:
                 raise DecodeError("misaligned decode at 0x%x" % cur)
@@ -1374,6 +1394,8 @@ def build_cfg(raw, ranges, entries, indirect_targets, base=0, module=False,
                         raise DecodeError("branch target not 4-aligned: 0x%x" % t)
                     if not in_ranges(ranges, t):
                         raise DecodeError("branch target outside ranges: 0x%x" % t)
+                    if restrict is not None and not r_lo <= t < r_hi:
+                        continue
                     if t not in starts:
                         starts.add(t)
                         work.append(t)
@@ -1394,6 +1416,8 @@ def build_cfg(raw, ranges, entries, indirect_targets, base=0, module=False,
             nxt = cur + 4
             if nxt in starts:
                 break
+            if restrict is not None and not r_lo <= nxt < r_hi:
+                break
             cur = nxt
         blocks.append({"pc": pc, "insns": insns})
     return blocks, visited
@@ -1401,7 +1425,7 @@ def build_cfg(raw, ranges, entries, indirect_targets, base=0, module=False,
 
 # ------------------------------------------------- local-switch pipeline
 
-def module_cfg(raw, ranges, entries, base, layout):
+def module_cfg(raw, ranges, entries, base, layout, restrict=None):
     """Build the module CFG, then extend it only with proven local switch
     edges from already-reached BR sites.
 
@@ -1413,10 +1437,15 @@ def module_cfg(raw, ranges, entries, base, layout):
     DecodeError for the whole module (even PARTIAL); edges are never
     retracted. Proofs are marked `verified-final-graph` only after the final
     discover succeeded on the graph built from the final edge set.
+
+    `restrict` (opt-in, default None = today's behaviour) is forwarded to
+    every `build_cfg` call: the D024 Stage B catalog builds a function-local
+    graph over one FDE window.  A proof over that graph is a CANDIDATE only;
+    authority still comes from the proof over the admitted closure.
     """
     import g3_local_switch
     blocks, visited = build_cfg(raw, ranges, entries, [], base=base,
-                                module=True)
+                                module=True, restrict=restrict)
     if not any(ins.get("kind") == "br"
                and g3_local_switch.matches_shape(raw, base, pc)
                for pc, ins in visited.items()):
@@ -1430,7 +1459,8 @@ def module_cfg(raw, ranges, entries, base, layout):
     provisional = {}
     for _ in range(64):
         blocks, visited = build_cfg(raw, ranges, entries, [], base=base,
-                                    module=True, local_edges=local)
+                                    module=True, local_edges=local,
+                                    restrict=restrict)
         try:
             # Stage 1 (provisional): defer ONLY undecoded raw incoming-branch
             # threats, so the proven case paths can be decoded into the graph.

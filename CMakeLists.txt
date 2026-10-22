@@ -1617,6 +1617,21 @@ if(MN_BUILD_AOT_PROOF)
     set_tests_properties(aot_g3_ctor_native PROPERTIES TIMEOUT 300
         ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
+    # D024 Stage B: candidate catalog + authority table ("compiled is not
+    # authorized"). Today's emission (X) and the catalog/table emission (Y)
+    # run through the actual loader/AS/Program from the same fresh load and
+    # must agree field by field (Unicorn A57 as a third oracle where it can
+    # model the path). A child process re-runs the suite with a wrong
+    # authority step (monkeypatched in that child only), which must FAIL.
+    add_test(NAME aot_g3_fde_emit
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_fde_emit_test.py"
+                --repo "${CMAKE_SOURCE_DIR}"
+                --tools "${CMAKE_SOURCE_DIR}/tools/aot"
+                --llvm "${AOT_LLVM_BIN_DIR}")
+    set_tests_properties(aot_g3_fde_emit PROPERTIES TIMEOUT 600
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
     # Native + Unicorn A57 differential of the emitted local-switch guard:
     # compiles the ACTUAL generated C for four variants with MSVC /W4 /WX /O2
     # in an external temp dir and direct-calls the translated basic blocks
@@ -1935,6 +1950,23 @@ if(MN_BUILD_AOT_PROOF)
                     --v0-dir "${MN_TOTK_V0_DIR}"
                     --work "${CMAKE_CURRENT_BINARY_DIR}/aot_gen/fde_frontend")
         set_tests_properties(aot_g3_fde_frontend_real PROPERTIES TIMEOUT 900
+            ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+        # D024 Stage B on the real modules: catalog main 0x1520 and sdk
+        # __nnmusl_init_dso, run the authority step over the registered real
+        # slice roots and require today's AotImage/bodies. Optional
+        # MN_TOTK_ROOTS_DIR points at a Start-prefix work dir whose admitted
+        # roots reach the targets (entries_<m>_real.json). Not executed.
+        set(_fde_emit_real_args --v0-dir "${MN_TOTK_V0_DIR}"
+            --work "${CMAKE_CURRENT_BINARY_DIR}/aot_gen/fde_emit")
+        if(MN_TOTK_ROOTS_DIR)
+            list(APPEND _fde_emit_real_args --roots-dir "${MN_TOTK_ROOTS_DIR}")
+        endif()
+        add_test(NAME aot_g3_fde_emit_real
+            COMMAND "${AOT_PYTHON}"
+                    "${CMAKE_SOURCE_DIR}/tests/aot/g3_fde_emit_real_test.py"
+                    ${_fde_emit_real_args})
+        set_tests_properties(aot_g3_fde_emit_real PROPERTIES TIMEOUT 900
             ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
         # ---- Item D: execute the translated real slice ------------------
