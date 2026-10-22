@@ -6,7 +6,7 @@ User full task remains active: implement real initializer, then CONTINUE faithfu
 
 w33 previous validated baseline (68/68 Debug+Release,46 runtime mutants). w39 first provider checkpoint (watchdog15min, not a completed deliverable). w41 successor fixing review edge cases/docs; use CURRENT reviewed provider successor, do not revert to w33. No commits/main edits.
 
-Real resources externally prepared at `C:/Users/IKER/mn-g3-local/v0/romfs-init`: all6 IVFC + repo expected-v1.0.0.json image pin matched; image17069139640bytes SHA4751542f544d8c3406cb63ccfc68b42690ff0387228d1f0af021d1f0037dafcf; index304207files,26012873bytes SHA17272f3836fdfafe3d1537c40b02ecd1bed8cdc95d00ba4efbc3c74c89d61efa; external romfs_config.h usual3defines. No overlays present; no resolution override. Lead standalone w39 fullhash provider passed and read atimageoffset0x100002e20 matched independentstdio64bytes (romfs-real-w39-run.log); final successor still needs actual boot validation.
+Real resources externally prepared at `<local-work>/v0/romfs-init`: all6 IVFC + repo expected-v1.0.0.json image pin matched; image17069139640bytes SHA4751542f544d8c3406cb63ccfc68b42690ff0387228d1f0af021d1f0037dafcf; index304207files,26012873bytes SHA17272f3836fdfafe3d1537c40b02ecd1bed8cdc95d00ba4efbc3c74c89d61efa; external romfs_config.h usual3defines. No overlays present; no resolution override. Lead standalone w39 fullhash provider passed and read atimageoffset0x100002e20 matched independentstdio64bytes (romfs-real-w39-run.log); final successor still needs actual boot validation.
 
 ## Implementation: tiny explicit G4 translated adapter
 

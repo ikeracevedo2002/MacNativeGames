@@ -1,7 +1,7 @@
 # Current G3 checkpoint — w10-2 RBIT + DMB ISH, stopped before new CFG decision
 
 ## Candidate / disposition
-- Current source: `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w10-2` (worker w10), seeded byte-for-byte from frozen w8-2.
+- Current source: `<worktrees>/w10-2` (worker w10), seeded byte-for-byte from frozen w8-2.
 - Delta vs w8-2: ONLY `tools/aot/aot_translate.py`, `tests/aot/g3_decoder_module_test.py`, `tests/aot/g3_newfamily_diff_test.py`. External patch: `w10-from-w8.patch`.
 - No commit/integration. Main and w8-2 unchanged. No PORTING_STATUS exit change; G3 OPEN.
 - RBIT completed, then continued through the real next small blocker DMB ISH, as requested. The new stop needs a new local-CFG-edge policy; nothing implementing that policy has been written.

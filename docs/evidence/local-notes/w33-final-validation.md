@@ -2,7 +2,7 @@
 
 ## Candidate / scope
 
-Current source: `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w33`.
+Current source: `<worktrees>/w33`.
 Preserved previous candidate: `w19-2`. w36 supplied only a reviewed AS+AS-probe correction for the inherited Release defect, applied to w33 candidate, not main. No Git commits, integration, pushes or main-checkout modifications. Main clean at d3b45204. Workers stopped; worktrees retained.
 
 Exactly eight delta paths versus w19-2:
@@ -21,13 +21,13 @@ Source SHA256 manifest: `w33-final-source-manifest.json`. Existing-file CRLF pre
 
 CMake/CTest executables:
 `C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/{cmake.exe,ctest.exe}`.
-External build: `C:/Users/IKER/mn-g3-local/build-w34` (source points to w33, VS18 AMD64, MN_BUILD_AOT_PROOF=ON, MN_TOTK_V0_DIR external v0). New targets and touched AOT targets compile `/W4 /WX`; Release optimization was NOT disabled.
+External build: `<local-work>/build-w34` (source points to w33, VS18 AMD64, MN_BUILD_AOT_PROOF=ON, MN_TOTK_V0_DIR external v0). New targets and touched AOT targets compile `/W4 /WX`; Release optimization was NOT disabled.
 
 For each `cfg` in `Debug`, `Release`, in sequence:
 
 ```text
-cmake --build C:/Users/IKER/mn-g3-local/build-w34 --config <cfg> --parallel 4
-ctest --test-dir C:/Users/IKER/mn-g3-local/build-w34 -C <cfg> --output-on-failure
+cmake --build <local-work>/build-w34 --config <cfg> --parallel 4
+ctest --test-dir <local-work>/build-w34 -C <cfg> --output-on-failure
 ```
 
 | Configuration | Build exit | CTest exit | Full CTest | Time |
@@ -40,7 +40,7 @@ Logs: `w33-final-{Debug,Release}-{build,ctest}.log`.
 Additional direct mutant-driver validation BOTH configs:
 
 ```text
-python w33/tools/aot/g3_mutant_test.py --exedir C:/Users/IKER/mn-g3-local/build-w34/<cfg>
+python w33/tools/aot/g3_mutant_test.py --exedir <local-work>/build-w34/<cfg>
 ```
 
 Both exits0: **rejected=46, infra_failures=0**. Logs `w33-final-{Debug,Release}-mutants.log`.
@@ -60,14 +60,14 @@ Direct binary logs `w33-{Debug,Release}-aot_g3_start_hle_*.log` are from before 
 
 ```text
 python w33/tools/aot/g3_start_prefix.py
-  --repo C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w33
-  --work C:/Users/IKER/mn-g3-local/start-w33-final
-  --v0-dir C:/Users/IKER/mn-g3-local/v0
+  --repo <worktrees>/w33
+  --work <local-work>/start-w33-final
+  --v0-dir <local-work>/v0
   --vcvars "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Auxiliary/Build/vcvars64.bat"
   --max-iterations 8
 ```
 
-Used Python: `C:/Users/IKER/AppData/Local/Python/pythoncore-3.14-64/python.exe`, PYTHONDONTWRITEBYTECODE=1. Native driver build `/W4 /WX /O2`.
+Used Python: `<python>`, PYTHONDONTWRITEBYTECODE=1. Native driver build `/W4 /WX /O2`.
 
 Driver exit0 means captured real typed blocker, NOT successful boot:
 

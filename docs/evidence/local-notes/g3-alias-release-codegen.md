@@ -6,7 +6,7 @@ Unchanged `w33`/`w19-2` address-space source passes Debug but fails Release. Lea
 
 New override positive and X0/WRITE/COUNT controls separately meet their exact exit/first-failure contracts in both configs. The alias failure predates that increment (the relevant AS/probe files are byte-identical to w19-2).
 
-External minimization: `C:/Users/IKER/mn-g3-local/aliasfix-cl/` (`micro2.c`, `buildmicro2.cmd`, `m2rel/micro2.exe`, `m2dbg/micro2.exe`, `m2rel/asm/micro2.asm`; in-situ assembly `asm/aot_as.asm`). No game data needed by the minimal repro.
+External minimization: `<local-work>/aliasfix-cl/` (`micro2.c`, `buildmicro2.cmd`, `m2rel/micro2.exe`, `m2dbg/micro2.exe`, `m2rel/asm/micro2.asm`; in-situ assembly `asm/aot_as.asm`). No game data needed by the minimal repro.
 
 Observed compiler: MSVC **19.51.36248.0**, x64, VS18 toolset directory 14.51.36231. Failing flags `/nologo /c /W4 /WX /TC /std:c11 /DWIN32 /D_WINDOWS /O2 /Ob2 /DNDEBUG`; original Debug uses `/Od`.
 

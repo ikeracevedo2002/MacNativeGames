@@ -33,8 +33,8 @@ Truth:
 ## Exact commands actually run
 
 ```
-cd C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w14-2
-export PATH="/c/Users/IKER/tools/LLVM/bin:$PATH"
+cd <worktrees>/w14-2
+export PATH="<llvm-bin>:$PATH"
 NF_OPT=/Od PYTHONDONTWRITEBYTECODE=1 <python> -B tests/aot/g3_newfamily_diff_test.py
 NF_OPT=/O2 PYTHONDONTWRITEBYTECODE=1 <python> -B tests/aot/g3_newfamily_diff_test.py
 ```

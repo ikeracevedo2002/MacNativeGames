@@ -1,7 +1,7 @@
 # D021 candidate: narrow offline veneer-root proof
 
 ## Goal and frozen source
-Seed managed successor from `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w2-5`, preserving own .git. Do not edit predecessors/main or commit/integrate. Read required project docs, D017/D008/D016 and root discovery code. Current actual Start: real early-G4 RomFS READY/files304207, original nnosInitialize/SDK/startup returned, main DT_INIT entered, stop AOT10 UNTRANSLATED at SDK0x102012c89c BRx2 ->main0x1002146110,1442blocks. No new G4 subsystem. G3 OPEN. All ISA/RFS/HLE code FROZEN.
+Seed managed successor from `<worktrees>/w2-5`, preserving own .git. Do not edit predecessors/main or commit/integrate. Read required project docs, D017/D008/D016 and root discovery code. Current actual Start: real early-G4 RomFS READY/files304207, original nnosInitialize/SDK/startup returned, main DT_INIT entered, stop AOT10 UNTRANSLATED at SDK0x102012c89c BRx2 ->main0x1002146110,1442blocks. No new G4 subsystem. G3 OPEN. All ISA/RFS/HLE code FROZEN.
 
 Primary and Opus/high specialist approved a bounded additional root category INSIDE G3, not arbitrary text/FDE-only/materialized values. This document is acceptance criteria, NOT permission for broad CFI/loader/runtime changes. Root is offline code generation only, no runtime ARM decode/JIT, no guest-state/pointer patch or hardcoded title VA.
 

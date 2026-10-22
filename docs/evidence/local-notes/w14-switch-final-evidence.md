@@ -1,6 +1,6 @@
 # Verified D022 local-switch increment — frozen w14-3
 
-Candidate `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w14-3`, not committed/integrated. G3 OPEN. Scope explicitly authorized by user: MODULE-ONLY bounded local CFG successors, never independent roots or global indirect-target seeding.
+Candidate `<worktrees>/w14-3`, not committed/integrated. G3 OPEN. Scope explicitly authorized by user: MODULE-ONLY bounded local CFG successors, never independent roots or global indirect-target seeding.
 
 ## Evidence
 - Opus w16 independently reviewed core and native; final H1-R corrective review found no remaining critical issue, conditional on frozen tests/real metadata. Those validation conditions were then met.

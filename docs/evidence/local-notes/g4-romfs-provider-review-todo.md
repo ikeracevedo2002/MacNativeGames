@@ -22,4 +22,4 @@ Source baseline w33, writer w39. User authorizes only early G4 init prerequisite
 
 Not genuine blockers from prior review: const parameter preference; private open-before-containment valid IF check precedes read/hash/publish; constant named MAX doesn't prove off-by-one (actual >= comparisons are correct); optional caching/proof records/whole-image mmap need not be ported to preserve full verification.
 
-Real input is ready externally C:/Users/IKER/mn-g3-local/v0/romfs-init, all6 IVFC and repo-pinned image hash match, index generated per Mac format. No game data copied into source. Boot not yet wired. Full details in handoff/brief.
+Real input is ready externally <local-work>/v0/romfs-init, all6 IVFC and repo-pinned image hash match, index generated per Mac format. No game data copied into source. Boot not yet wired. Full details in handoff/brief.

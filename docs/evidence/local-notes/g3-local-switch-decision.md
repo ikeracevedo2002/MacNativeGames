@@ -6,7 +6,7 @@ The user has now explicitly authorized bounded MODULE-ONLY local CFG edges for t
 Historical reason for the stop: this was a new data-derived CFG contract, not another instruction. Primary investigation and independent Opus review agreed that introducing local targets through the function-root channel would violate D021. That workaround remains forbidden.
 
 ## Frozen actual evidence
-Candidate: `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w10-2`.
+Candidate: `<worktrees>/w10-2`.
 Reboot: `start-w10-dmb.log` and `start-w10-dmb/run_start.log` (driver exits 1 on this correctly refused transfer; this path does not emit result.json).
 
 - 2018 blocks, code 10 UNTRANSLATED, status 0.

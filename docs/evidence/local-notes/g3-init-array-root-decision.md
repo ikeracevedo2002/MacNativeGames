@@ -4,7 +4,7 @@
 
 ## Demonstrated stop
 
-Frozen candidate: `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w17` (D022 local CFG edges + MODULE-ONLY UMULH).
+Frozen candidate: `<worktrees>/w17` (D022 local CFG edges + MODULE-ONLY UMULH).
 
 Same boot profile, `start-w17-umulh.log` and `start-w17-umulh/run_start.log`:
 

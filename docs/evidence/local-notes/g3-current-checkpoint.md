@@ -1,7 +1,7 @@
 # Current G3 checkpoint — w17 local-switch + UMULH, first constructor root blocked
 
 ## Candidate / disposition
-- Current source: `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w17`.
+- Current source: `<worktrees>/w17`.
 - Frozen predecessor: `.../w14-3` (D022 local-switch increment). Its evidence is `w14-switch-final-evidence.md`.
 - Delta w17 vs w14-3: ONLY `DECISIONS.md`, `tools/aot/aot_translate.py`, `tests/aot/g3_decoder_module_test.py`, `tests/aot/g3_newfamily_diff_test.py`; external patch `w17-from-w14-umulh.patch` (414 lines).
 - No commit/integration. Main clean. No PORTING_STATUS exit change; **G3 OPEN**.

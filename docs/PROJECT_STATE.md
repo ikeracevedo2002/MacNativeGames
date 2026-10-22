@@ -92,7 +92,7 @@ Open questions recorded but not decided:
 Requirements:
 - Windows x64, Visual Studio 2026 (VS 18) with MSVC.
 - CMake, plus Python 3 with `tools/aot/requirements.txt` (`unicorn==2.1.4`, `capstone==5.0.7`, pinned on purpose).
-- For the AOT tests, an LLVM toolchain with `llvm-mc`, `llvm-objcopy`, `ld.lld` and `llvm-readelf` (the developer used `C:/Users/IKER/tools/LLVM/bin`).
+- For the AOT tests, an LLVM toolchain with `llvm-mc`, `llvm-objcopy`, `ld.lld` and `llvm-readelf` (the developer used `<llvm-bin>`).
 
 Build directories must be outside the source tree, because CMake refuses in-tree builds.
 

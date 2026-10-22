@@ -1,7 +1,7 @@
 # Local evidence notes (imported 2026-10-22)
 
 These are the lead's and workers' working notes from G3 and the early G4 work,
-copied from the developer machine (`C:\Users\IKER\mn-g3-local`, `C:\Users\IKER\mn-research`)
+copied from the developer machine (`<local-work>`, `<local-research>`; see the placeholder key below)
 so that analysis without that machine has the full history.
 
 How to read them:
@@ -11,7 +11,7 @@ How to read them:
   record is `DECISIONS.md`, `PORTING_STATUS.md` and `docs/PROJECT_STATE.md`. When a
   note disagrees with them, the note is historical.
 - Worker names (`w14-3`, `w21-2`, ...) are harness worktrees under
-  `C:\Users\IKER\.pi\agent\harness\worktrees\MacNativeGames-106250b2\`. Everything that
+  `<worktrees>\`. Everything that
   matters from them has been integrated into `windows-x86-port` (see PROJECT_STATE);
   the worktrees themselves are not in the repository.
 - Paths such as `start-w21-ctor/`, `build-*/`, `v0/` refer to local build and run
@@ -20,6 +20,10 @@ How to read them:
 - Redaction: lines with raw game disassembly or byte dumps were replaced by
   `[N line(s) ... omitted ...]`. No keys, NSO/RomFS data or generated game code are
   included. Addresses, instruction mnemonics, counts and hashes are kept.
+- Local paths were replaced by placeholders: `<local-work>` = the developer's G3 work dir
+  (build dirs, Start runs, `v0/` game-derived inputs), `<local-research>` = the audit probe
+  dir, `<worktrees>` = the agent worktree root, `<llvm-bin>`, `<python>` and `<home>` = the
+  developer's toolchain/home directories.
 - Text is as written, often compressed shorthand; a few non-ASCII characters were lost
   in the copy (shown as `�`).
 

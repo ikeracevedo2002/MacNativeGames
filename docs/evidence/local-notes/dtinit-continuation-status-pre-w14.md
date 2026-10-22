@@ -4,7 +4,7 @@ Main checkout windows-x86-port at d3b45204 is CLEAN, untouched. NO commits/integ
 
 ## Current candidate / active work
 
-Latest writable worker w9 DeepSeek opencode-go/deepseek-v4.1-flash high, branch pi-agent/w9-2, path C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w9-2. It started from d3 and lead copied COMPLETE uncommitted w5-4 candidate (which itself contained all earlier ISA/tool/test work + Opus ABI repair + RNG + driver). Only w9 is latest canonical candidate; older worktrees kept, no cleanup/deletion.
+Latest writable worker w9 DeepSeek opencode-go/deepseek-v4.1-flash high, branch pi-agent/w9-2, path <worktrees>/w9-2. It started from d3 and lead copied COMPLETE uncommitted w5-4 candidate (which itself contained all earlier ISA/tool/test work + Opus ABI repair + RNG + driver). Only w9 is latest canonical candidate; older worktrees kept, no cleanup/deletion.
 
 W9 completed core heap + initial narrow tests, then HLE glue/GetInfo4/5/Svc1. It has QUEUED followup to fix Opus w11 test nonvacuity findings (M1-M3 + lows), about ~8min next repair block. Core architecture was frozen for review; review finished, now unfrozen for repairs. Need collect w9 outputs/check tests, then continue first actual new blocker (ALIAS GetInfo2).
 
@@ -16,7 +16,7 @@ Other workers w1 failed timeout, w2/w3/w4/w5/w6/w7/w8 stopped. Opus w4 repaired 
 
 ## Real execution: proper original Start, latest exact stop
 
-External log C:/Users/IKER/mn-g3-local/v0/start-w9-2-heap/run_start.log, lead independently read:
+External log <local-work>/v0/start-w9-2-heap/run_start.log, lead independently read:
 - LOAD558865 sites digest1 (same validated link data; do not reopen linker).
 - Proper Start mangled symbol _ZN2nn4init5StartEmmPFvvES2_S2_, sdk+0xfa060, args {mainhandle0x1001,0,ready/inits/finis GUEST thunks}. N177 -> window180, callbacks177..179.
 - Transparent real delegates 5 observer functions under D016; nnMain deliberately unregistered. Real nnMain main+0xe99570 =0x1000e99570 explicitly excluded from supplemental roots/autofollow. No G4 execution.
@@ -32,7 +32,7 @@ Mac services.c21-81: ALIAS_SPACE_AT0x7000000000(448GiB), ALIAS_SIZE64GiB desktop
 
 ## Heap design / review obligations
 
-Detailed accepted design C:/Users/IKER/mn-g3-local/g3-heap-design-reviewed.md. D018 in candidate is CANDIDATE heap capability, PortingStatus unchanged/G3OPEN. Heap impl src/aot/aot_as.c +h, aot_mem locked range invalidate. Public add heap preseal reserve-only, heap_info base/max/logicalsize, set_heap_size postseal. Highwater PRIVATE, no per-page AS flags allocated for heap; permissions/state derived logicalsize under domain lock.
+Detailed accepted design <local-work>/g3-heap-design-reviewed.md. D018 in candidate is CANDIDATE heap capability, PortingStatus unchanged/G3OPEN. Heap impl src/aot/aot_as.c +h, aot_mem locked range invalidate. Public add heap preseal reserve-only, heap_info base/max/logicalsize, set_heap_size postseal. Highwater PRIVATE, no per-page AS flags allocated for heap; permissions/state derived logicalsize under domain lock.
 
 Mac SetHeapSize310-313: 2MiB units, cap4GiB, size+image<=APP_POOL, invalidr0=d401 preservingr1size, successr0=0/r1base. Shrink ProtectNONE, retain committed bytes, regrow old bytes, new pages zero. HostVmCommit rejects alreadycommitted; grow fresh F=[hw,t) ONLYt>hw then retained R=[s,min(t,hw)) protectRW; failure rollback only newF, rollbackfail sticky. Shrink hostProtect first whilelocked; only success publish/invalidate monitors, failure leaves oldmap/reservations. No HLE callback under domainlock/no recursion. HOST status appended, old ordinalvalues unchanged.
 

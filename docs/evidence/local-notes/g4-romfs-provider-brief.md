@@ -4,7 +4,7 @@
 
 User explicitly authorizes a correct Windows counterpart of Mac `services.c:175 -> runtime_fs_init -> romfs.c:169-191`, solely to unblock faithful real G3 constructor validation. This is EARLY G4 WORK, NOT filesystem reclassified into G3. G3 stays OPEN and its original all-real-DT_INIT exit condition is unchanged. No commits/integration until explicit `Integra`.
 
-Source baseline is current **w33**: `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w33`. All prior increments uncommitted there. Main checkout clean at d3b45204. User data/build outputs stay outside any source tree.
+Source baseline is current **w33**: `<worktrees>/w33`. All prior increments uncommitted there. Main checkout clean at d3b45204. User data/build outputs stay outside any source tree.
 
 ## Scope and exclusions
 
@@ -12,7 +12,7 @@ Implement only immutable real RomFS resource-provider initialization/lifetime an
 
 ## Read before implementation
 
-AGENTS.md, GOAL.md, DECISIONS.md, ARCHITECTURE.md, PORTING_PLAN.md, PORTING_STATUS.md in order, then Mac `games/totk/runtime/romfs.c:1-244`, `services.c:167-177,237-240`, `romfs_path.h`, `games/totk/scripts/prepare_romfs_backend.py`. Existing analysis `C:/Users/IKER/mn-g3-local/g3-fs-initialization-boundary.md`; earlier prohibition there is SUPERSEDED only by this narrow user authorization, not by permission for G4 generally. Preserve Mac sources.
+AGENTS.md, GOAL.md, DECISIONS.md, ARCHITECTURE.md, PORTING_PLAN.md, PORTING_STATUS.md in order, then Mac `games/totk/runtime/romfs.c:1-244`, `services.c:167-177,237-240`, `romfs_path.h`, `games/totk/scripts/prepare_romfs_backend.py`. Existing analysis `<local-work>/g3-fs-initialization-boundary.md`; earlier prohibition there is SUPERSEDED only by this narrow user authorization, not by permission for G4 generally. Preserve Mac sources.
 
 ## Lead design decisions (document as candidate D020)
 
@@ -46,4 +46,4 @@ CMake test/library available without TotK; `/W4 /WX` Debug and Release (/O2 stay
 
 Implement provider + game-free native probe/fixture generation + explicit negative controls/CMake registration + short docs/D020 candidate. DO NOT yet wire Start, run game boot, or alter translator/HLE/AS code; lead will delegate followup after review. STOP settled after provider's narrow Debug/Release positive and negative tests. If too large for watchdog, deliver stable first code/test checkpoint with exact limits, no fake completion.
 
-Use new build dir `C:/Users/IKER/mn-g3-local/build-g4-romfs`; CMake/CTest from `C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/`. Read `build-w34/CMakeCache.txt` for existing options, but source must point to your own successor worktree. All artifacts external. Prefer precise edit for existing files, preserve CRLF there; new files consistent. No git commit/reset/checkout, no source game artifacts, no broad rewrite. Report concise changed files, contract choices, commands/exits, failure/negative counts, remaining limitations; do not paste giant inherited HEAD diff.
+Use new build dir `<local-work>/build-g4-romfs`; CMake/CTest from `C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/`. Read `build-w34/CMakeCache.txt` for existing options, but source must point to your own successor worktree. All artifacts external. Prefer precise edit for existing files, preserve CRLF there; new files consistent. No git commit/reset/checkout, no source game artifacts, no broad rewrite. Report concise changed files, contract choices, commands/exits, failure/negative counts, remaining limitations; do not paste giant inherited HEAD diff.

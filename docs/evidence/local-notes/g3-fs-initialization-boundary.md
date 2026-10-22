@@ -4,13 +4,13 @@
 
 The user explicitly required stopping BEFORE implementing `nn::fs::InitializeForApplication` or another real filesystem/runtime-state service. The lead has stopped the faithful Start path at this boundary. FS remains unregistered; no fabricated success, Result, TotK-specific data answer, skip-SDK-init, or patched guest state was introduced. G3 remains OPEN. Nothing committed, integrated or pushed.
 
-Current override candidate: `C:/Users/IKER/.pi/agent/harness/worktrees/MacNativeGames-106250b2/w33`. Baseline preserved in `w19-2`. Main checkout remains untouched.
+Current override candidate: `<worktrees>/w33`. Baseline preserved in `w19-2`. Main checkout remains untouched.
 
 ## Measured callsite and state (not a prediction)
 
 Lead-run original Start, offline-generated native AMD64 AOT, `/W4 /WX /O2`:
 
-- Final artifacts after the alias correction: `C:/Users/IKER/mn-g3-local/start-w33-final/{result.json,run_start.log,build_start.log}`; driver log `start-w33-final.log`. Initial measured run `start-w33-overrides/` is preserved and stops at exactly the same boundary. Final Debug/Release full CTest is 68/68 each, runtime mutants46 rejected/infra0 each; see `w33-final-validation.md`.
+- Final artifacts after the alias correction: `<local-work>/start-w33-final/{result.json,run_start.log,build_start.log}`; driver log `start-w33-final.log`. Initial measured run `start-w33-overrides/` is preserved and stops at exactly the same boundary. Final Debug/Release full CTest is 68/68 each, runtime mutants46 rejected/infra0 each; see `w33-final-validation.md`.
 - Driver exit **0** means **typed blocker captured**, NOT successful Start/G3 closure.
 - **400 dispatched AOT basic blocks**, NOT 400 individual ARM instructions. Earlier descriptions that called `steps` instruction counts were inaccurate: the runtime increments it per translated block.
 - Fault `AOT_FAULT_BAD_HLE = 7`, status **28**, image `sdk_real`.
