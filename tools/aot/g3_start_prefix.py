@@ -917,6 +917,10 @@ def build(repo, work, args, desc, images, exe, config_c):
                 os.path.join(repo, "src", "host_random.c"), desc, config_c]
                + _flatten_images(images)
                + [os.path.join(repo, s) for s in CORE])
+    # One spelling per file: CORE uses '/' and os.path.join adds '\' on
+    # Windows; the cache key includes the path, so mixed separators would
+    # give the same TU two keys.
+    sources = [os.path.normpath(s) for s in sources]
     try:
         cid = compiler_id(args)
     except DriverError as exc:
