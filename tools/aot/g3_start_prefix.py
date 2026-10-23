@@ -31,8 +31,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -534,39 +536,256 @@ def run(cmd, **kw):
     return p
 
 
+# Per-TU compile flags, in the order the single-cl build used them. The /I
+# paths are repo-relative: the compile bat runs with cwd = repo, so the list
+# is a constant and the cache key does not depend on where the checkout is.
+COMPILE_FLAGS = ["/nologo", "/W4", "/WX", "/O2", "/std:c11", "/bigobj",
+                 "/D_CRT_SECURE_NO_WARNINGS",
+                 "/Isrc\\aot", "/Isrc", "/Itests\\aot"]
+HEADER_DIRS = ("src", "src/aot", "tests/aot")
+
+# Counters of the most recent build() (tests read them).
+LAST_BUILD = {"compiled": 0, "reused": 0}
+_COMPILER_IDS = {}
+
+
+def _win(path):
+    return path.replace("/", "\\")
+
+
+def header_digest(repo):
+    """SHA-256 over every *.h (non-recursive) in HEADER_DIRS that exists."""
+    found = []
+    for rel_dir in HEADER_DIRS:
+        d = os.path.join(repo, *rel_dir.split("/"))
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            full = os.path.join(d, name)
+            if name.endswith(".h") and os.path.isfile(full):
+                with open(full, "rb") as f:
+                    found.append((rel_dir + "/" + name, f.read()))
+    h = hashlib.sha256()
+    for rel, data in sorted(found):
+        h.update(rel.encode("utf-8") + b"\0")
+        h.update(str(len(data)).encode("ascii") + b"\0")
+        h.update(data)
+    return h.hexdigest()
+
+
+def cache_key(source_bytes, flags, compiler_id, headers_sha):
+    doc = {"src": hashlib.sha256(source_bytes).hexdigest(),
+           "flags": list(flags), "compiler": compiler_id,
+           "headers": headers_sha}
+    canon = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _run_bat(bat_path):
+    p = subprocess.run([bat_path], capture_output=True, text=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+def compiler_id(args):
+    """SHA-256 of cl's first non-blank banner line; one cl run per process."""
+    key = (args.vcvars, args.cl)
+    if key not in _COMPILER_IDS:
+        tdir = tempfile.mkdtemp(prefix="g3clid_")
+        try:
+            bat = os.path.join(tdir, "cl_id.bat")
+            with open(bat, "w", encoding="ascii") as f:
+                f.write('@call "%s" >nul\r\n' % _win(args.vcvars))
+                f.write('"%s"\r\n' % _win(args.cl))
+            _rc, out, err = _run_bat(bat)
+        finally:
+            shutil.rmtree(tdir, ignore_errors=True)
+        lines = [ln for ln in (out + err).splitlines() if ln.strip()]
+        if not lines:
+            raise DriverError("cl printed no banner; cannot key the cache")
+        _COMPILER_IDS[key] = hashlib.sha256(
+            lines[0].encode("utf-8")).hexdigest()
+    return _COMPILER_IDS[key]
+
+
+def _flatten_images(images):
+    """Image paths: modules by name, list order kept within a module."""
+    out = []
+    for name in sorted(images):
+        value = images[name]
+        if isinstance(value, str):
+            out.append(value)
+        else:
+            out.extend(value)
+    return out
+
+
+def _obj_path(objdir, key):
+    return os.path.join(objdir, key + ".obj")
+
+
+def _tmp_obj(objdir, key):
+    return os.path.join(objdir, "tmp_%s.obj" % key)
+
+
+def _load_index(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            idx = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return idx if isinstance(idx, dict) else {}
+
+
+def _save_index(path, idx):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(idx, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _reusable(ent, obj):
+    return (isinstance(ent, dict) and os.path.isfile(obj)
+            and sha256_file(obj) == ent.get("obj_sha256"))
+
+
+def _append_log(log_path, out, err):
+    with open(log_path, "a", encoding="utf-8") as lf:
+        lf.write(out)
+        lf.write(err)
+
+
+def _echo_failure(out, err):
+    sys.stdout.write(out)
+    sys.stderr.write(err)
+
+
+def _compile_missing(repo, work, args, index, index_path, todo, log_path):
+    """Compile (src, key) pairs to tmp objects, then publish them.
+
+    Any failure returns False and records nothing in the index.
+    """
+    objdir = os.path.join(work, "obj")
+    lines = ['@call "%s" >nul' % _win(args.vcvars),
+             'cd /d "%s" || exit /b 1' % _win(repo)]
+    for src, key in todo:
+        cmd = (['"%s"' % _win(args.cl), "/c"] + COMPILE_FLAGS
+               + ["/MP", '/Fo:"%s"' % _win(_tmp_obj(objdir, key)),
+                  '"%s"' % _win(src), "|| exit /b 1"])
+        lines.append(" ".join(cmd))
+    bat = os.path.join(work, "build_compile.bat")
+    with open(bat, "w", encoding="ascii") as f:
+        f.write("\r\n".join(lines) + "\r\n")
+    rc, out, err = _run_bat(bat)
+    _append_log(log_path, out, err)
+    produced = all(os.path.isfile(_tmp_obj(objdir, key))
+                   for _src, key in todo)
+    if rc != 0 or not produced:
+        _echo_failure(out, err)
+        for _src, key in todo:
+            if os.path.exists(_tmp_obj(objdir, key)):
+                os.remove(_tmp_obj(objdir, key))
+        return False
+    recorded = dict(index)
+    for src, key in todo:
+        final = _obj_path(objdir, key)
+        os.replace(_tmp_obj(objdir, key), final)
+        recorded[key] = {"source": src, "obj_sha256": sha256_file(final)}
+    _save_index(index_path, recorded)
+    LAST_BUILD["compiled"] = len(todo)
+    return True
+
+
+def _link(work, args, exe, objs, log_path):
+    if args.cl != "cl.exe":
+        linker = '"%s"' % _win(os.path.join(os.path.dirname(args.cl),
+                                            "link.exe"))
+    else:
+        linker = "link"
+    cmd = ([linker, "/nologo", '/OUT:"%s"' % _win(exe)]
+           + ['"%s"' % _win(o) for o in objs]
+           + ["bcrypt.lib", "|| exit /b 1"])
+    bat = os.path.join(work, "build_link.bat")
+    with open(bat, "w", encoding="ascii") as f:
+        f.write('@call "%s" >nul\r\n' % _win(args.vcvars))
+        f.write(" ".join(cmd) + "\r\n")
+    rc, out, err = _run_bat(bat)
+    _append_log(log_path, out, err)
+    if rc != 0:
+        _echo_failure(out, err)
+        return False
+    return True
+
+
+def _build_result(ok, t_compile, t_link):
+    print("BUILD compiled=%d reused=%d"
+          % (LAST_BUILD["compiled"], LAST_BUILD["reused"]))
+    return ok, t_compile, t_link
+
+
 def build(repo, work, args, desc, images, exe, config_c):
-    sources = ([os.path.join(repo, "tests", "aot",
-                             "aot_g3_start_probe.c"),
+    """Compile stale per-TU objects, then link.
+
+    Returns (ok, t_compile, t_link). Objects are cached as
+    work/obj/<cache_key>.obj with an index in work/obj/cache.json; the
+    compiler output of this build is in work/build_start.log.
+    """
+    repo = os.path.abspath(repo)
+    LAST_BUILD["compiled"] = 0
+    LAST_BUILD["reused"] = 0
+    objdir = os.path.join(work, "obj")
+    index_path = os.path.join(objdir, "cache.json")
+    log_path = os.path.join(work, "build_start.log")
+    open(log_path, "w", encoding="utf-8").close()
+    sources = ([os.path.join(repo, "tests", "aot", "aot_g3_start_probe.c"),
                 os.path.join(repo, "tests", "aot", "g3_start_hle.c"),
                 os.path.join(repo, "tests", "aot", "g4_romfs_start_hle.c"),
                 os.path.join(repo, "src", "romfs_provider.c"),
                 os.path.join(repo, "src", "romfs_file_win.c"),
                 os.path.join(repo, "src", "host_random.c"), desc, config_c]
-               + list(images.values())
+               + _flatten_images(images)
                + [os.path.join(repo, s) for s in CORE])
-    bat = os.path.join(work, "build_start.bat")
-    with open(bat, "w", encoding="ascii") as f:
-        f.write('@call "%s" >nul\r\n' % args.vcvars.replace("/", "\\"))
-        cmd = ['"%s"' % args.cl.replace("/", "\\"), "/nologo", "/W4", "/WX",
-               "/O2", "/std:c11", "/bigobj", "/D_CRT_SECURE_NO_WARNINGS",
-               "/Fo:%s\\\\" % os.path.join(work, "obj").replace("/", "\\"),
-               "/I%s" % os.path.join(repo, "src", "aot").replace("/", "\\"),
-               "/I%s" % os.path.join(repo, "src").replace("/", "\\"),
-               "/I%s" % os.path.join(repo, "tests", "aot").replace("/", "\\"),
-               "/Fe:%s" % exe.replace("/", "\\")]
-        cmd += ['"%s"' % s.replace("/", "\\") for s in sources]
-        cmd.append("bcrypt.lib")
-        f.write(" ".join(cmd) + "\r\n")
-    p = subprocess.run([bat], capture_output=True, text=True)
-    with open(os.path.join(work, "build_start.log"), "w",
-              encoding="utf-8") as lf:
-        lf.write(p.stdout)
-        lf.write(p.stderr)
-    if p.returncode != 0:
-        sys.stdout.write(p.stdout)
-        sys.stderr.write(p.stderr)
-        return False
-    return True
+    try:
+        cid = compiler_id(args)
+    except DriverError as exc:
+        print("FAIL: " + str(exc))
+        return _build_result(False, 0.0, 0.0)
+    headers = header_digest(repo)
+    index = _load_index(index_path)
+    os.makedirs(objdir, exist_ok=True)
+    t0 = time.perf_counter()
+    plan = []
+    todo = []
+    seen = set()
+    reused = 0
+    for src in sources:
+        try:
+            with open(src, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            print("FAIL: cannot read build source: %s" % exc)
+            return _build_result(False, 0.0, 0.0)
+        key = cache_key(data, COMPILE_FLAGS, cid, headers)
+        obj = _obj_path(objdir, key)
+        plan.append(obj)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _reusable(index.get(key), obj):
+            reused += 1
+        else:
+            if os.path.exists(obj):
+                os.remove(obj)
+            todo.append((src, key))
+    LAST_BUILD["reused"] = reused
+    ok = True
+    if todo:
+        ok = _compile_missing(repo, work, args, index, index_path, todo,
+                              log_path)
+    t_compile = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    if ok:
+        ok = _link(work, args, exe, plan, log_path)
+    return _build_result(ok, t_compile, time.perf_counter() - t0)
 
 
 def classify_stop(st, decode, thunk_base, thunk_count):
@@ -1033,12 +1252,8 @@ def main(argv):
             desc = emit_desc(repo, args, work, v0, modules)
             t["emit_desc"] = time.perf_counter() - t0
             exe = os.path.join(work, "aot_g3_start_probe.exe")
-            t0 = time.perf_counter()
-            built = build(repo, work, args, desc, imgs, exe, config_c)
-            # build() is one cl call, so its whole time is compile; step 1.3
-            # splits compile from link and fills t_link.
-            t["compile"] = time.perf_counter() - t0
-            t["link"] = 0.0
+            built, t["compile"], t["link"] = build(
+                repo, work, args, desc, imgs, exe, config_c)
             if not built:
                 return fail("build failed")
             t0 = time.perf_counter()

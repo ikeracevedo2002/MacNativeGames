@@ -6,9 +6,14 @@ import sys
 sys.dont_write_bytecode = True
 
 import contextlib
+import hashlib
 import io
+import json
 import os
+import re
+import shutil
 import struct
+import tempfile
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -124,6 +129,72 @@ def timing_passes(rec):
         return G.validate_timing_record(rec) is rec
     except G.DriverError:
         return False
+
+
+def _write(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _unwin(path):
+    return path.replace("\\", "/")
+
+
+def _key_tracks_headers(key_fn, src, flags, cid, d_before, d_after):
+    """True when a key function changes across a header digest change."""
+    return (key_fn(src, flags, cid, d_before)
+            != key_fn(src, flags, cid, d_after))
+
+
+def _wrong_key_ignores_headers(source_bytes, flags, compiler_id,
+                               headers_sha):
+    # Deliberately wrong: the header digest is dropped from the key.
+    return G.cache_key(source_bytes, flags, compiler_id, "")
+
+
+class FakeToolchain:
+    """Stands in for G._run_bat: 'compiles' and 'links' by writing files."""
+
+    def __init__(self):
+        self.events = []
+        self.fail_source = None
+        self.link_objs = None
+
+    def __call__(self, bat_path):
+        with open(bat_path, encoding="ascii") as f:
+            lines = [ln for ln in f.read().splitlines() if ln]
+        if any("/Fo:" in ln for ln in lines):
+            return self._compile(lines)
+        return self._link(lines)
+
+    def _compile(self, lines):
+        for ln in lines:
+            if "/Fo:" not in ln:
+                continue
+            obj = _unwin(re.search(r'/Fo:"([^"]+)"', ln).group(1))
+            src = _unwin(re.findall(r'"([^"]+\.c)"', ln)[-1])
+            name = os.path.basename(src)
+            self.events.append("compile:" + name)
+            if name == self.fail_source:
+                return 2, "fake cl\n", "fake cl error C2061 in %s\n" % name
+            with open(src, "rb") as f:
+                body = f.read()
+            _write(obj, b"OBJ\0" + body)
+        return 0, "fake cl ok\n", ""
+
+    def _link(self, lines):
+        ln = [x for x in lines if "/OUT:" in x][0]
+        exe = _unwin(re.search(r'/OUT:"([^"]+)"', ln).group(1))
+        objs = [_unwin(o) for o in re.findall(r'"([^"]+\.obj)"', ln)]
+        self.events.append("link")
+        self.link_objs = [os.path.basename(o) for o in objs]
+        blob = b"EXE\0"
+        for o in objs:
+            with open(o, "rb") as f:
+                blob += f.read()
+        _write(exe, blob)
+        return 0, "fake link ok\n", ""
 
 
 def main():
@@ -642,6 +713,270 @@ def main():
                           G._inside(REPO, tdir), False)
     finally:
         shutil.rmtree(tdir)
+
+    # --- content-addressed object cache (plan step 1.3) -------------------
+    base_src = b"int x;\n"
+    flags0 = list(G.COMPILE_FLAGS)
+    k0 = G.cache_key(base_src, flags0, "cl-19.44", "h0")
+    failures += check("cache_key is stable for identical inputs",
+                      G.cache_key(base_src, list(flags0), "cl-19.44", "h0"),
+                      k0)
+    failures += check("cache_key changes with one source byte",
+                      G.cache_key(bytes([base_src[0] ^ 1]) + base_src[1:],
+                                  flags0, "cl-19.44", "h0") != k0, True)
+    failures += check("cache_key changes with one flag",
+                      G.cache_key(base_src, flags0 + ["/Zi"], "cl-19.44",
+                                  "h0") != k0, True)
+    failures += check("cache_key is sensitive to flag order",
+                      G.cache_key(base_src, list(reversed(flags0)),
+                                  "cl-19.44", "h0") != k0, True)
+    failures += check("cache_key changes with the compiler id",
+                      G.cache_key(base_src, flags0, "cl-19.45", "h0") != k0,
+                      True)
+    failures += check("cache_key changes with headers_sha",
+                      G.cache_key(base_src, flags0, "cl-19.44", "h1") != k0,
+                      True)
+
+    hdr_tmp = tempfile.mkdtemp(prefix="g3hdr_")
+    try:
+        tree = os.path.join(hdr_tmp, "repo")
+
+        def tpath(rel):
+            return os.path.join(tree, *rel.split("/"))
+
+        hdr_files = {"src/aot/a.h": b"#define A 1\n",
+                     "src/b.h": b"#define B 2\n",
+                     "tests/aot/t.h": b"#define T 3\n"}
+        for rel, data in sorted(hdr_files.items()):
+            _write(tpath(rel), data)
+        _write(tpath("src/x.c"), b"int x;\n")
+        d0 = G.header_digest(tree)
+        failures += check("header_digest is stable for an unchanged tree",
+                          G.header_digest(tree), d0)
+        for rel, data in sorted(hdr_files.items()):
+            _write(tpath(rel), data + b"/* edit */\n")
+            failures += check("header_digest changes with %s" % rel,
+                              G.header_digest(tree) != d0, True)
+            _write(tpath(rel), data)
+        failures += check("restoring headers restores the digest",
+                          G.header_digest(tree), d0)
+        _write(tpath("src/x.c"), b"int y;\n")
+        failures += check("a non-header edit leaves header_digest alone",
+                          G.header_digest(tree), d0)
+        _write(tpath("src/aot/a.h"), hdr_files["src/aot/a.h"] + b"/*e*/\n")
+        d1 = G.header_digest(tree)
+        failures += check("real key passes the header-change check",
+                          _key_tracks_headers(G.cache_key, base_src, flags0,
+                                              "cl-19.44", d0, d1), True)
+        failures += check("NEGATIVE: header-blind key fails the header check",
+                          _key_tracks_headers(_wrong_key_ignores_headers,
+                                              base_src, flags0, "cl-19.44",
+                                              d0, d1), False)
+    finally:
+        shutil.rmtree(hdr_tmp, ignore_errors=True)
+
+    failures += check("_flatten_images: module order, list order kept",
+                      G._flatten_images({"sdk_real": "s.c",
+                                         "main_real": ["m2.c", "m1.c"],
+                                         "aa": ["x.c"]}),
+                      ["x.c", "m2.c", "m1.c", "s.c"])
+    failures += check("_flatten_images: plain str value",
+                      G._flatten_images({"a": "one.c"}), ["one.c"])
+
+    build_tmp = tempfile.mkdtemp(prefix="g3objbuild_")
+    saved_run, saved_id = G._run_bat, G.compiler_id
+    try:
+        banner = ("Microsoft (R) C/C++ Optimizing Compiler Version "
+                  "19.44.35207 for x64")
+        id_calls = []
+
+        def fake_id_bat(bat):
+            id_calls.append(bat)
+            return 2, "", banner + "\nCopyright (C) Microsoft\n"
+
+        G._run_bat = fake_id_bat
+        G._COMPILER_IDS.clear()
+        id_args = types.SimpleNamespace(vcvars="C:\\fake\\vcvars64.bat",
+                                        cl="C:\\fake\\cl.exe")
+        first_id = G.compiler_id(id_args)
+        second_id = G.compiler_id(id_args)
+        failures += check("compiler_id runs cl once per process",
+                          len(id_calls), 1)
+        failures += check("compiler_id is SHA-256 of the banner line",
+                          first_id == second_id and first_id ==
+                          hashlib.sha256(banner.encode("utf-8")).hexdigest(),
+                          True)
+
+        fake = FakeToolchain()
+        G._run_bat = fake
+        G.compiler_id = lambda _args: "fake-cl-19.44"
+
+        repo = os.path.join(build_tmp, "repo")
+
+        def rpath(rel):
+            return os.path.join(repo, *rel.split("/"))
+
+        rel_six = ["tests/aot/aot_g3_start_probe.c",
+                   "tests/aot/g3_start_hle.c",
+                   "tests/aot/g4_romfs_start_hle.c",
+                   "src/romfs_provider.c", "src/romfs_file_win.c",
+                   "src/host_random.c"]
+        for rel in rel_six + list(G.CORE):
+            _write(rpath(rel), ("/* %s */\n" % rel).encode("ascii"))
+        desc = os.path.join(build_tmp, "gen", "real_desc.c")
+        config_c = os.path.join(build_tmp, "gen", "romfs_config.c")
+        _write(desc, b"/* desc */\n")
+        _write(config_c, b"/* config */\n")
+
+        def img(name):
+            return os.path.join(build_tmp, "img", name)
+
+        images = {"sdk_real": img("sdk.c"),
+                  "main_real": [img("main_a.c"), img("main_b.c")]}
+        for p in G._flatten_images(images):
+            _write(p, ("/* %s */\n" % os.path.basename(p)).encode("ascii"))
+        sources = ([rpath(r) for r in rel_six] + [desc, config_c]
+                   + [img("main_a.c"), img("main_b.c"), img("sdk.c")]
+                   + [rpath(c) for c in G.CORE])
+        n = len(sources)
+
+        work = os.path.join(build_tmp, "work")
+        os.makedirs(work)
+        exe = os.path.join(work, "probe.exe")
+        objdir = os.path.join(work, "obj")
+        index_path = os.path.join(objdir, "cache.json")
+        bargs = types.SimpleNamespace(vcvars="C:\\fake\\vcvars64.bat",
+                                      cl="cl.exe")
+
+        def run_build():
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out):
+                with contextlib.redirect_stderr(err):
+                    res = G.build(repo, work, bargs, desc, images, exe,
+                                  config_c)
+            return res, out.getvalue()
+
+        def counters():
+            return (G.LAST_BUILD["compiled"], G.LAST_BUILD["reused"])
+
+        def read_index():
+            with open(index_path, encoding="utf-8") as f:
+                return json.load(f)
+
+        def obj_of(key):
+            return os.path.join(objdir, key + ".obj")
+
+        # 1. cold build: every source compiled, one link, index complete.
+        fake.events = []
+        (ok, tc, tl), out = run_build()
+        failures += check("cold build succeeds", ok, True)
+        failures += check("cold build compiles every source",
+                          counters(), (n, 0))
+        failures += check("cold build prints the BUILD line", out,
+                          "BUILD compiled=%d reused=0\n" % n)
+        failures += check("cold build: compile each source, then link",
+                          fake.events,
+                          ["compile:" + os.path.basename(s) for s in sources]
+                          + ["link"])
+        failures += check("timings are non-negative floats",
+                          all(isinstance(x, float) and x >= 0
+                              for x in (tc, tl)), True)
+        with open(os.path.join(work, "build_start.log"),
+                  encoding="utf-8") as lf:
+            log_text = lf.read()
+        failures += check("build log holds the compiler output",
+                          "fake cl ok" in log_text
+                          and "fake link ok" in log_text, True)
+        idx = read_index()
+        key_of = {v["source"]: k for k, v in idx.items()}
+        failures += check("index records every source once", len(idx), n)
+        failures += check("index sources are the build sources",
+                          sorted(v["source"] for v in idx.values()),
+                          sorted(sources))
+        failures += check("link takes objects in source order",
+                          fake.link_objs,
+                          [key_of[s] + ".obj" for s in sources])
+        failures += check("index hashes match the object files",
+                          all(G.sha256_file(obj_of(k)) == v["obj_sha256"]
+                              for k, v in idx.items()), True)
+
+        # 2. identical rebuild: nothing compiled, everything reused.
+        fake.events = []
+        (ok, tc, tl), out = run_build()
+        failures += check("identical rebuild succeeds", ok, True)
+        failures += check("identical rebuild compiles nothing",
+                          counters(), (0, n))
+        failures += check("identical rebuild prints the BUILD line", out,
+                          "BUILD compiled=0 reused=%d\n" % n)
+        failures += check("identical rebuild only links", fake.events,
+                          ["link"])
+
+        # 3. one source byte changed: exactly that source recompiled.
+        _write(rpath("src/host_random.c"),
+               b"/* host_random changed */\n")
+        fake.events = []
+        (ok, tc, tl), out = run_build()
+        failures += check("one changed source: build succeeds", ok, True)
+        failures += check("one changed source: compiled == 1, reused == n-1",
+                          counters(), (1, n - 1))
+        failures += check("one changed source: only it is compiled",
+                          fake.events,
+                          ["compile:host_random.c", "link"])
+
+        # 4. a cached object whose bytes were corrupted is recompiled.
+        idx = read_index()
+        key_of = {v["source"]: k for k, v in idx.items()}
+        probe_key = key_of[rpath(rel_six[0])]
+        _write(obj_of(probe_key), b"CORRUPT")
+        fake.events = []
+        (ok, tc, tl), out = run_build()
+        failures += check("corrupt cached object: build succeeds", ok, True)
+        failures += check("corrupt cached object: compiled == 1",
+                          counters(), (1, n - 1))
+        failures += check("corrupt cached object: that source recompiled",
+                          fake.events,
+                          ["compile:aot_g3_start_probe.c", "link"])
+        failures += check("corrupt cached object: rebuilt hash is indexed",
+                          G.sha256_file(obj_of(probe_key)),
+                          read_index()[probe_key]["obj_sha256"])
+
+        # 5. a failed compile returns False and records nothing.
+        _write(img("sdk.c"), b"/* sdk v2 */\n")
+        with open(index_path, "rb") as f:
+            before = f.read()
+        fake.fail_source = "sdk.c"
+        fake.events = []
+        (ok, tc, tl), out = run_build()
+        failures += check("failed compile returns ok False", ok, False)
+        failures += check("failed compile: compiled == 0, reused == n-1",
+                          counters(), (0, n - 1))
+        # Failure echoes the compiler stdout first (as before), then BUILD.
+        failures += check("failed compile prints the BUILD line last",
+                          out.endswith("BUILD compiled=0 reused=%d\n"
+                                       % (n - 1)), True)
+        failures += check("failed compile never links", fake.events,
+                          ["compile:sdk.c"])
+        with open(index_path, "rb") as f:
+            after = f.read()
+        failures += check("failed compile leaves cache.json unchanged",
+                          after, before)
+        failures += check("failed compile leaves no tmp objects",
+                          [f for f in os.listdir(objdir)
+                           if f.startswith("tmp_")], [])
+
+        # 6. after the failure is fixed, only the failed source compiles.
+        fake.fail_source = None
+        fake.events = []
+        (ok, tc, tl), out = run_build()
+        failures += check("retry after failure succeeds", ok, True)
+        failures += check("retry after failure: compiled == 1",
+                          counters(), (1, n - 1))
+        failures += check("retry after failure: only sdk.c compiled",
+                          fake.events, ["compile:sdk.c", "link"])
+    finally:
+        G._run_bat, G.compiler_id = saved_run, saved_id
+        G._COMPILER_IDS.clear()
+        shutil.rmtree(build_tmp, ignore_errors=True)
 
     if failures:
         print("FAIL: %d classification check(s)" % failures)
