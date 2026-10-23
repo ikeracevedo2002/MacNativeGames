@@ -119,6 +119,11 @@ Expected counts (last verified 2026-10-22 at `45c89fa`, Debug and Release, 0 war
 | AOT on, no game data | 77 (82 minus the five real-data tests; not separately re-run) |
 | AOT on + `MN_TOTK_V0_DIR` | 82: adds `aot_g3_real_link`, `aot_g3_real_exec`, `aot_g3_real_exec_neg`, `aot_g3_fde_frontend_real`, `aot_g3_fde_emit_real` |
 
+- Cloud-side Stage C prerequisites (2026-10-23, plan steps 1.1, 1.4, 1.2.6) add two hermetic
+  CTests, `aot_g3_stage_c_select` and `aot_g3_fde_emit_receipt`, so the expected counts become
+  79 (AOT on, no game data) and 84 (with `MN_TOTK_V0_DIR`). **Not yet verified on Windows:** they
+  were run only as Python scripts on Linux; the Debug/Release battery, `aot_g3_fde_emit` and the
+  legacy timing baseline run (`--timing-out`) are pending on the Windows machine.
 - Preparing the real-data directory (decrypted NSO -> flat images, layouts, reference link, Mac binding tables) is described in `docs/g3-module-loader.md` §5.1. RomFS preparation is in `docs/romfs-provider.md`.
 - A cloud environment without the game cannot run the real-data tests or the Start-prefix driver. Their latest results are recorded in `DECISIONS.md` (D017–D024 evidence) and `docs/evidence/local-notes/`.
 - Python tests need site-packages, so do not run them with `python -I`.
