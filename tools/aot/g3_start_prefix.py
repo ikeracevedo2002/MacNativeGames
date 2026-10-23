@@ -879,6 +879,7 @@ def main(argv):
         timing_out = str(Path(args.timing_out).resolve())
         if _inside(repo, timing_out):
             return fail("--timing-out must be outside the repository")
+        os.makedirs(os.path.dirname(timing_out), exist_ok=True)
     os.makedirs(os.path.join(work, "img"), exist_ok=True)
     os.makedirs(os.path.join(work, "obj"), exist_ok=True)
 
