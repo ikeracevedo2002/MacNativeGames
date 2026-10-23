@@ -1606,6 +1606,13 @@ if(MN_BUILD_AOT_PROOF)
     set_tests_properties(aot_g3_fde_frontend PROPERTIES TIMEOUT 300
         ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
+    # D024 Stage C step 1.4: pure stratified catalog-window selector
+    # (authority none; its output feeds `g3_fde_emit.py catalog --select`).
+    add_test(NAME aot_g3_stage_c_select
+        COMMAND "${AOT_PYTHON}" "${CMAKE_SOURCE_DIR}/tests/aot/g3_stage_c_select_test.py")
+    set_tests_properties(aot_g3_stage_c_select PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
     # D023 lazy root discovery through actual loader/AS/Program dispatch.
     # Native misses supply the slot evidence; the guest walks both constructors.
     add_test(NAME aot_g3_ctor_native
