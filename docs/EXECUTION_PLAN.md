@@ -416,3 +416,22 @@ Además:
 - Nuevo: `tools/aot/g3_stage_c_select.py`.
 - Tests: `tests/aot/g3_start_prefix_test.py`, `tests/aot/g3_fde_emit_test.py`, `tests/aot/aot_g3_start_probe.c` (contador `CTOR_RET`, verificación de lotes D025 si se aprueba).
 - Documentación: `DECISIONS.md` (evidencia D024, D008/D025/D026 candidate), `docs/PROJECT_STATE.md`, `PORTING_STATUS.md` (solo al cerrar G3), `docs/evidence/stage-c-measurement.md`.
+
+## 9. Entrega nube → Windows (2026-10-23)
+
+Hecho en la nube (Linux, sin MSVC ni datos), commits `e83551d`…`597f6bf`:
+
+- 1.1 `--timing-out` (registro validado por iteración, incluye `t_prepare` y `t_equivalence`).
+- 1.2 `--backend catalog`, `--catalog-n`, `--equivalence-every K` / `--equivalence-check`; `resolve_status`; refresco de catálogo al agotar sus siguientes constructores.
+- 1.2.6 `g3_fde_emit.py table --verify-mode bound --receipt` con recibo escrito tras un `regenerate`.
+- 1.3 caché de `.obj` por contenido (fuente + ruta + flags + banner de `cl` + cabeceras) y enlace separado.
+- 1.4 `tools/aot/g3_stage_c_select.py` (corte en el primer slot no admitido).
+
+Validado solo como scripts Python en Linux. **Nada de lo anterior se ha ejecutado con MSVC ni con datos.** El bucle principal del backend catalog y `run_equivalence` no tienen test hermético. Orden de validación en Windows:
+
+1. Batería CTest Debug y Release completa; recuentos esperados 79 (AOT on sin datos) y 84 (con `MN_TOTK_V0_DIR`). Incluye `aot_g3_fde_emit` (MSVC), `aot_g3_fde_emit_receipt` y `aot_g3_stage_c_select`.
+2. Línea base legacy (Paso 1.1.5) con `--timing-out`. Comprobar que imprime `BUILD compiled=N reused=0` en la iteración 0 y `reused>0` después (la caché de 1.3 se usa también en legacy).
+3. Paso 1.2.9: `--backend catalog --equivalence-check --max-iterations 8`. Cualquier `equivalence_mismatch` o `REFUSED` se investiga antes de seguir; no se desactiva la puerta.
+4. Paso 1.5 (medición) y la puerta 🛑 1.6.
+
+Puntos dudosos a vigilar en la primera ejecución real: comillas de `/Fo:"…"` y `/OUT:"…"`, que `link` resuelva al de MSVC tras `vcvars`, el banner de `cl` sin argumentos usado como id del compilador, y que la caché `work/obj` no se poda (crece por iteración).
