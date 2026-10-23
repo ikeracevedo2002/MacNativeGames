@@ -119,6 +119,13 @@ def expect_driver_error_containing(label, fn, needle):
     return 1
 
 
+def timing_passes(rec):
+    try:
+        return G.validate_timing_record(rec) is rec
+    except G.DriverError:
+        return False
+
+
 def main():
     failures = 0
     failures += check("clean return",
@@ -561,6 +568,80 @@ def main():
                           ("refused", "tail-is-nnmain"))
     finally:
         shutil.rmtree(tmpdir)
+
+    # Per-iteration --timing-out records (plan step 1.1).
+    timing_rec = {
+        "iteration": 0, "backend": "legacy", "roots": {"main_real": 3},
+        "t_translate": {"main_real": 0.25, "sdk_real": 1},
+        "t_bind": 0.0, "t_emit_desc": 0.01, "t_compile": 1.5,
+        "t_link": 0.0, "t_run": 0.5, "t_classify": 0.001, "t_total": 2.3,
+        "c_bytes": {"main_real": 1024}, "obj_bytes": 4096, "exe_bytes": None,
+        "steps": 12,
+        "stop": {"code": 10, "src": 0x10201584B0, "target": 0x10200FA060,
+                 "status": 0},
+        "admitted": {"kind": "old", "va": 0x10200FA060},
+    }
+    timing_last = {
+        "iteration": 1, "backend": "legacy", "roots": {},
+        "t_translate": {}, "t_bind": 0.0, "t_emit_desc": 0.0,
+        "t_compile": 0.0, "t_link": 0.0, "t_run": 0.0, "t_classify": 0.0,
+        "t_total": 0.0, "c_bytes": {}, "obj_bytes": None, "exe_bytes": 8192,
+        "steps": None, "stop": None, "admitted": None,
+    }
+    failures += check("valid timing record passes",
+                      timing_passes(timing_rec), True)
+    failures += check("valid timing record with None fields passes",
+                      timing_passes(timing_last), True)
+    no_run = dict(timing_rec)
+    del no_run["t_run"]
+    failures += expect_driver_error(
+        "timing record missing t_run",
+        lambda: G.validate_timing_record(no_run))
+    failures += expect_driver_error(
+        "timing record extra key",
+        lambda: G.validate_timing_record(dict(timing_rec, surprise=1)))
+    failures += expect_driver_error(
+        "timing record negative t_total",
+        lambda: G.validate_timing_record(dict(timing_rec, t_total=-0.1)))
+    failures += expect_driver_error(
+        "timing stop missing status",
+        lambda: G.validate_timing_record(dict(
+            timing_rec, stop={"code": 10, "src": 1, "target": 2})))
+    failures += expect_driver_error(
+        "timing admitted va as string",
+        lambda: G.validate_timing_record(dict(
+            timing_rec, admitted={"kind": "old", "va": "0x10200FA060"})))
+    failures += expect_driver_error(
+        "timing roots value as float",
+        lambda: G.validate_timing_record(dict(
+            timing_rec, roots={"main_real": 3.0})))
+
+    import json
+    import shutil
+    import tempfile
+    tdir = tempfile.mkdtemp(prefix="g3timing_")
+    try:
+        out = os.path.join(tdir, "timing.json")
+        G.write_timing(out, [timing_rec, timing_last])
+        with open(out, encoding="utf-8") as f:
+            back = json.load(f)
+        failures += check("write_timing round-trips records", back,
+                          [timing_rec, timing_last])
+        bad_out = os.path.join(tdir, "bad.json")
+        failures += expect_driver_error(
+            "write_timing rejects an invalid record",
+            lambda: G.write_timing(bad_out, [timing_rec, no_run]))
+        failures += check("invalid write creates no target or tmp file",
+                          os.path.exists(bad_out)
+                          or os.path.exists(bad_out + ".tmp"), False)
+        failures += check("_inside: path in repo is inside",
+                          G._inside(REPO, os.path.join(REPO, "tests",
+                                                       "timing.json")),
+                          True)
+        failures += check("_inside: temp dir outside repo is not inside",
+                          G._inside(REPO, tdir), False)
+    finally:
+        shutil.rmtree(tdir)
 
     if failures:
         print("FAIL: %d classification check(s)" % failures)

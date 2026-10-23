@@ -66,6 +66,11 @@ CORE = [
 START_SYM = "_ZN2nn4init5StartEmmPFvvES2_S2_"
 # The probe pins this exact VA; resolve it from dynsym instead of trusting it.
 START_VA = 0x10200FA060
+# Required keys of every --timing-out record (one per completed iteration).
+TIMING_KEYS = ("iteration", "backend", "roots", "t_translate", "t_bind",
+               "t_emit_desc", "t_compile", "t_link", "t_run", "t_classify",
+               "t_total", "c_bytes", "obj_bytes", "exe_bytes", "steps",
+               "stop", "admitted")
 
 
 class DriverError(Exception):
@@ -75,6 +80,15 @@ class DriverError(Exception):
 def fail(msg):
     print("FAIL: " + msg)
     return 1
+
+
+def _inside(repo, path):
+    try:
+        common = os.path.commonpath([os.path.normcase(repo),
+                                     os.path.normcase(path)])
+    except ValueError:
+        common = ""
+    return os.path.normcase(common) == os.path.normcase(repo)
 
 
 def sha256_file(path):
@@ -470,6 +484,7 @@ def batch_indirect_targets(world, roots, index, modules, stop_entries=None):
 def translate(repo, args, work, v0, modules, entries):
     imgs = {}
     metas = {}
+    secs = {}
     for m in modules:
         name = m["name"]
         es = sorted(entries.get(name, set()))
@@ -481,6 +496,7 @@ def translate(repo, args, work, v0, modules, entries):
             json.dump(es, f)
         img = os.path.join(work, "img", name + ".c")
         meta = os.path.join(work, "img", name + ".meta.json")
+        t0 = time.perf_counter()
         run([args.python, os.path.join(repo, "tools", "aot",
                                        "aot_translate.py"),
              "--module", "--partial",
@@ -488,10 +504,11 @@ def translate(repo, args, work, v0, modules, entries):
              "--layout", os.path.join(v0, "link", name + ".layout.json"),
              "--guest-base", hex(m["base"]), "--entries", ep,
              "--name", name, "--out", img, "--meta-out", meta])
+        secs[name] = time.perf_counter() - t0
         imgs[name] = img
         with open(meta, encoding="utf-8") as f:
             metas[name] = json.load(f)
-    return imgs, metas
+    return imgs, metas, secs
 
 
 def emit_desc(repo, args, work, v0, modules):
@@ -742,6 +759,99 @@ def capstone_one(flat, base, va):
     return "word=0x%08x %s %s" % (word, ins[0].mnemonic, ins[0].op_str)
 
 
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_nonneg_int(v):
+    return _is_int(v) and v >= 0
+
+
+def _is_secs(v):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and v >= 0)
+
+
+def validate_timing_record(rec):
+    if not isinstance(rec, dict):
+        raise DriverError("timing record is not a dict: %r" % (rec,))
+    missing = [k for k in TIMING_KEYS if k not in rec]
+    if missing:
+        raise DriverError("timing record missing keys %s" % missing)
+    extra = sorted(set(rec) - set(TIMING_KEYS))
+    if extra:
+        raise DriverError("timing record has unexpected keys %s" % extra)
+    if not _is_int(rec["iteration"]):
+        raise DriverError("timing iteration must be int")
+    if not isinstance(rec["backend"], str):
+        raise DriverError("timing backend must be str")
+    if rec["steps"] is not None and not _is_int(rec["steps"]):
+        raise DriverError("timing steps must be int or None")
+    for key, check, what in (("roots", _is_nonneg_int, "int"),
+                             ("t_translate", _is_secs, "seconds"),
+                             ("c_bytes", _is_nonneg_int, "int")):
+        val = rec[key]
+        if not isinstance(val, dict) or not all(
+                isinstance(k, str) and check(v) for k, v in val.items()):
+            raise DriverError("timing %s must be a dict of str -> %s"
+                              % (key, what))
+    for key in ("t_bind", "t_emit_desc", "t_compile", "t_link", "t_run",
+                "t_classify", "t_total"):
+        if not _is_secs(rec[key]):
+            raise DriverError("timing %s must be a non-negative number"
+                              % key)
+    for key in ("obj_bytes", "exe_bytes"):
+        if rec[key] is not None and not _is_nonneg_int(rec[key]):
+            raise DriverError("timing %s must be int or None" % key)
+    stop = rec["stop"]
+    if stop is not None:
+        if not isinstance(stop, dict) or set(stop) != {"code", "src",
+                                                       "target", "status"}:
+            raise DriverError("timing stop must be None or exactly "
+                              "code,src,target,status")
+        if not all(_is_int(v) for v in stop.values()):
+            raise DriverError("timing stop fields must be int")
+    adm = rec["admitted"]
+    if adm is not None:
+        if not isinstance(adm, dict) or set(adm) != {"kind", "va"}:
+            raise DriverError("timing admitted must be None or exactly "
+                              "kind,va")
+        if not isinstance(adm["kind"], str) or not _is_int(adm["va"]):
+            raise DriverError("timing admitted needs str kind and int va")
+    return rec
+
+
+def write_timing(path, records):
+    for rec in records:
+        validate_timing_record(rec)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def iteration_record(work, iteration, entries, imgs, exe, st, t, admitted):
+    """One TIMING_KEYS record from main()'s per-phase clocks (seconds)."""
+    obj_sizes = [os.path.getsize(os.path.join(d, f))
+                 for d, _dirs, files in os.walk(os.path.join(work, "obj"))
+                 for f in files]
+    stop = None
+    if st is not None:
+        stop = {k: st[k] for k in ("code", "src", "target", "status")}
+    return validate_timing_record(dict(
+        iteration=iteration, backend="legacy",
+        roots={n: len(v) for n, v in entries.items()},
+        t_translate=t["translate"], t_bind=t["bind"],
+        t_emit_desc=t["emit_desc"], t_compile=t["compile"],
+        t_link=t["link"], t_run=t["run"], t_classify=t["classify"],
+        t_total=t["total"],
+        c_bytes={n: os.path.getsize(p) for n, p in imgs.items()},
+        obj_bytes=sum(obj_sizes) if obj_sizes else None,
+        exe_bytes=os.path.getsize(exe) if os.path.exists(exe) else None,
+        steps=st["steps"] if st is not None else None,
+        stop=stop, admitted=admitted))
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=".")
@@ -757,17 +867,18 @@ def main(argv):
     ap.add_argument("--romfs-overlay-dir")
     ap.add_argument("--romfs-required-overlay-dir")
     ap.add_argument("--romfs-no-overlays", action="store_true")
+    ap.add_argument("--timing-out")
     args = ap.parse_args(argv)
     repo = str(Path(args.repo).resolve())
     work = str(Path(args.work).resolve())
     v0 = str(Path(args.v0_dir).resolve())
-    try:
-        common = os.path.commonpath([os.path.normcase(repo),
-                                     os.path.normcase(work)])
-    except ValueError:
-        common = ""
-    if os.path.normcase(common) == os.path.normcase(repo):
+    if _inside(repo, work):
         return fail("--work must be outside the repository")
+    timing_out = None
+    if args.timing_out:
+        timing_out = str(Path(args.timing_out).resolve())
+        if _inside(repo, timing_out):
+            return fail("--timing-out must be outside the repository")
     os.makedirs(os.path.join(work, "img"), exist_ok=True)
     os.makedirs(os.path.join(work, "obj"), exist_ok=True)
 
@@ -799,6 +910,7 @@ def main(argv):
                  start_cfg["image_size"], start_cfg["index_sha256"],
                  [o["dir"] for o in start_cfg["overlays"]]))
 
+    timing = []     # one validated record per completed iteration
     try:
         modules = load_meta(v0)
         crosscheck_inputs(v0, modules)
@@ -880,12 +992,26 @@ def main(argv):
         # Capstone evidence that the blocker site really is an SVC and what
         # immediate it carries (never guess a mnemonic from the fault code).
         blocker = None
+
+        def done(admitted):
+            """Close this iteration's clocks; record it when timing is on."""
+            now = time.perf_counter()
+            t["classify"] = now - t["cls0"]
+            t["total"] = now - t["iter"]
+            if timing_out:
+                timing.append(iteration_record(work, iteration, entries, imgs,
+                                               exe, st, t, admitted))
+                write_timing(timing_out, timing)
+
         for iteration in range(args.max_iterations):
             print("== iteration %d" % iteration)
+            t = {"iter": time.perf_counter()}
             entries = {}
             for name, vals in by_mod.items():
                 entries[name] = set(vals)
-            imgs, metas = translate(repo, args, work, v0, modules, entries)
+            imgs, metas, t["translate"] = translate(repo, args, work, v0,
+                                                    modules, entries)
+            t0 = time.perf_counter()
             if veneer_audit:
                 # Bind every proved flat SHA to the compiled image metadata
                 # BEFORE the rebuilt image is executed.
@@ -901,12 +1027,23 @@ def main(argv):
                     except CR.CtorInputError as exc:
                         raise DriverError("ctor audit binding: %s"
                                           % exc) from exc
+            t["bind"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             desc = emit_desc(repo, args, work, v0, modules)
+            t["emit_desc"] = time.perf_counter() - t0
             exe = os.path.join(work, "aot_g3_start_probe.exe")
-            if not build(repo, work, args, desc, imgs, exe, config_c):
+            t0 = time.perf_counter()
+            built = build(repo, work, args, desc, imgs, exe, config_c)
+            # build() is one cl call, so its whole time is compile; step 1.3
+            # splits compile from link and fills t_link.
+            t["compile"] = time.perf_counter() - t0
+            t["link"] = 0.0
+            if not built:
                 return fail("build failed")
+            t0 = time.perf_counter()
             p = subprocess.run([exe, os.path.join(v0, "link")],
                                capture_output=True, text=True)
+            t["run"] = time.perf_counter() - t0
             log = os.path.join(work, "run_start.log")
             with open(log, "w", encoding="utf-8") as lf:
                 lf.write(p.stdout)
@@ -914,6 +1051,7 @@ def main(argv):
             if p.returncode != 0:
                 sys.stderr.write(p.stderr)
                 return fail("probe exited %d" % p.returncode)
+            t["cls0"] = time.perf_counter()
             st = parse_stop(p.stdout)
             if st is None:
                 return fail("no STARTSTOP line")
@@ -943,6 +1081,7 @@ def main(argv):
                 print("PRE_G4_BOUNDARY kind=nnMain target=0x%x module=%s "
                       "(not seeded, not followed, not executed)"
                       % (st["target"], nnmain_mod))
+                done(None)
                 break
             if st["code"] == 10:
                 site_kind = None
@@ -974,6 +1113,7 @@ def main(argv):
                           "same-module DT_INIT_ARRAY walk; no STT symbol "
                           "fabricated)" % (st["target"], decision["label"],
                                            ev["module"], ev["slot"]))
+                    done({"kind": decision["kind"], "va": st["target"]})
                     continue
                 if decision["kind"] == "veneer":
                     ok, why = record_follow(by_mod, modules, st["target"],
@@ -996,6 +1136,7 @@ def main(argv):
                              evidence["tail"]["target"],
                              evidence["tail"]["symbol"]["name"],
                              evidence["eh"]["offset"]))
+                    done({"kind": decision["kind"], "va": st["target"]})
                     continue
                 if decision["kind"] == "refused":
                     print("UNJUSTIFIED target 0x%x is not a DEFINED STT_FUNC "
@@ -1017,6 +1158,7 @@ def main(argv):
                     return fail(why)
                 print("FOLLOW 0x%x %s (%s bind=%d size=%d)"
                       % (st["target"], hit[1], hit[0], hit[2], hit[3]))
+                done({"kind": decision["kind"], "va": st["target"]})
                 continue
             blocker = dict(stop=st, image=mm["name"] if mm else None,
                            decode=dec, kind=cls["kind"],
@@ -1065,6 +1207,7 @@ def main(argv):
                       "target=0x%x status=%d"
                       % (st["code"], mm["name"] if mm else "?", st["src"],
                          st["target"], st["status"]))
+            done(None)
             break
         if blocker is None:
             return 2
@@ -1124,6 +1267,10 @@ def main(argv):
         return result_exit_code(result["kind"])
     except DriverError as exc:
         return fail(str(exc))
+    finally:
+        # Early fail() returns still keep the iterations already completed.
+        if timing_out and timing:
+            write_timing(timing_out, timing)
 
 
 if __name__ == "__main__":
