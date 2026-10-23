@@ -197,6 +197,389 @@ class FakeToolchain:
         return 0, "fake link ok\n", ""
 
 
+MOD_BASE = 0x7100000000
+SDK_BASE = 0x7200000000
+
+
+def _arg(cmd, flag):
+    return cmd[cmd.index(flag) + 1]
+
+
+class FakeTool:
+    """Stands in for G.run: writes the outputs the real D024 tools write.
+
+    Records every argv.  `refuse` names modules whose table build fails the
+    way g3_fde_emit does (stdout REFUSED line, DriverError with .stdout).
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.refuse = set()
+        self.boundaries = []
+
+    def __call__(self, cmd, **_kw):
+        self.calls.append(list(cmd))
+        tool = os.path.basename(cmd[1])
+        if tool == "g3_fde_frontend.py":
+            doc = {"schema_version": G.SEL.F.SCHEMA_VERSION,
+                   "kind": G.SEL.F.KIND, "authority": G.SEL.F.AUTHORITY,
+                   "module": {"sha256": "0" * 64},
+                   "boundaries": [{"start": "0x%x" % s, "end": "0x%x" % e}
+                                  for s, e in self.boundaries]}
+            _write(_arg(cmd, "--out"),
+                   json.dumps(doc).encode("utf-8"))
+            return None
+        if cmd[2] == "catalog":
+            _write(_arg(cmd, "--out-c"), b"/* catalog */\n")
+            _write(_arg(cmd, "--out-json"), b'{"identity": "x"}')
+            return None
+        name = _arg(cmd, "--name")
+        if name in self.refuse:
+            err = G.DriverError("command failed: %s" % (cmd,))
+            err.stdout = "REFUSED partition-mismatch\n"
+            raise err
+        _write(_arg(cmd, "--out-c"), b"/* table %s */\n" % name.encode())
+        meta = {"name": name, "source_sha256": hashlib.sha256(
+            name.encode("utf-8")).hexdigest(), "unsupported": [],
+            "local_switch_sites": []}
+        _write(_arg(cmd, "--out-json"),
+               json.dumps(meta).encode("utf-8"))
+        _write(_arg(cmd, "--report"), b"{}")
+        if "--write-receipt" in cmd:
+            _write(_arg(cmd, "--write-receipt"), b'{"kind": "receipt"}')
+        return None
+
+
+def _catalog_stop(status, src=MOD_BASE + 0x200):
+    return {"code": 16, "src": src, "target": src + 4, "status": status,
+            "steps": 9}
+
+
+def _catalog_meta(status, pc=MOD_BASE + 0x200):
+    return {"unsupported": [{"status": status, "pc": "0x%x" % pc,
+                             "word": "0x00000000", "reason": "x"}],
+            "local_switch_sites": []}
+
+
+def catalog_backend_checks():
+    failures = 0
+    tmpdirs = []
+    saved_run = G.run
+    try:
+        # resolve_status: one place that maps a status to its metadata.
+        leg = {"unsupported": [{"status": 0, "pc": "0x%x" % (MOD_BASE + 0x200),
+                                "word": "0x1", "reason": "r"}],
+               "local_switch_sites": [{"br_pc": "0x%x" % (MOD_BASE + 0x300),
+                                       "status": -5}]}
+        hit = G.resolve_status(leg, 0, MOD_BASE + 0x200)
+        failures += check("resolve_status unique unsupported hit kind",
+                          hit[0], "unsupported")
+        failures += check("resolve_status unique unsupported hit entry",
+                          hit[1], leg["unsupported"][0])
+        hit = G.resolve_status(leg, -5, MOD_BASE + 0x300)
+        failures += check("resolve_status unique switch hit",
+                          (hit[0], hit[1]), ("switch",
+                                             leg["local_switch_sites"][0]))
+        failures += check("resolve_status zero hits is None",
+                          G.resolve_status(leg, 7, MOD_BASE + 0x200), None)
+        failures += check("resolve_status unsupported with another pc is None",
+                          G.resolve_status(leg, 0, MOD_BASE + 0x204), None)
+        dup = dict(leg, unsupported=leg["unsupported"] * 2)
+        failures += expect_driver_error(
+            "resolve_status duplicate unsupported status is ambiguous",
+            lambda: G.resolve_status(dup, 0, MOD_BASE + 0x200))
+        dup_sw = dict(leg, local_switch_sites=leg["local_switch_sites"] * 2)
+        failures += expect_driver_error(
+            "resolve_status duplicate switch status is ambiguous",
+            lambda: G.resolve_status(dup_sw, -5, MOD_BASE + 0x300))
+
+        # normalize_stop: namespaces do not matter, pc and raw fields do.
+        metas_leg = {"main_real": _catalog_meta(0)}
+        metas_cat = {"main_real": _catalog_meta(0x43500000)}
+        norm_leg = G.normalize_stop(_catalog_stop(0), metas_leg, "main_real")
+        norm_cat = G.normalize_stop(_catalog_stop(0x43500000), metas_cat,
+                                    "main_real")
+        failures += check("catalog and legacy statuses of one pc are equal",
+                          norm_leg == norm_cat, True)
+        failures += check("normalized status is the unsupported pc",
+                          norm_cat["status"], ("unsupported",
+                                               MOD_BASE + 0x200))
+        failures += check("raw catalog and legacy statuses differ",
+                          _catalog_stop(0)["status"] ==
+                          _catalog_stop(0x43500000)["status"], False)
+        failures += check("raw statuses that differ compare unequal",
+                          G.normalize_stop(_catalog_stop(1), {}, None) ==
+                          G.normalize_stop(_catalog_stop(2), {}, None), False)
+        # Same raw status and target; only src differs (no metadata hit).
+        src_a = _catalog_stop(5, MOD_BASE + 0x200)
+        src_b = dict(src_a, src=MOD_BASE + 0x204)
+        failures += check("NEGATIVE: stops differing only in src are unequal",
+                          G.normalize_stop(src_a, metas_leg, "main_real") ==
+                          G.normalize_stop(src_b, metas_leg, "main_real"),
+                          False)
+        failures += check("normalize_stop of no stop is None",
+                          G.normalize_stop(None, {}, None), None)
+
+        modules = [{"name": "main_real", "base": MOD_BASE,
+                    "image_size": 0x1000, "init_va": MOD_BASE + 0x100}]
+        out_cat = "STARTFAULTGPR code=10 reg=0 value=0x8 read_va=0x0 " \
+                  "read_status=-1 live=0x0\n"
+        view_cat = G.equivalence_view(_catalog_stop(0x43500000), out_cat,
+                                      metas_cat, modules)
+        view_leg = G.equivalence_view(_catalog_stop(0), out_cat, metas_leg,
+                                      modules)
+        failures += check("equivalence views equal across namespaces",
+                          view_cat == view_leg, True)
+        failures += check("equivalence view keeps GPR lines",
+                          view_leg["gprs"], [out_cat.rstrip("\n")])
+        failures += check("NEGATIVE: differing GPR line is unequal",
+                          G.equivalence_view(_catalog_stop(0), "", metas_leg,
+                                             modules) == view_leg, False)
+
+        # catalog_exhausted: refresh only when EVERY next ctor is admitted.
+        cat = {"next_ctors": {0x200, 0x300}}
+        failures += check("catalog partly admitted is not exhausted",
+                          G.catalog_exhausted(cat, {0x200}), False)
+        failures += check("catalog fully admitted is exhausted",
+                          G.catalog_exhausted(cat, {0x200, 0x300, 0x400}),
+                          True)
+        failures += check("catalog with no next ctors is not exhausted",
+                          G.catalog_exhausted({"next_ctors": set()}, {0x1}),
+                          False)
+
+        # translate_catalog: reuse, per-module regenerate/bound, REFUSED.
+        tmp = tempfile.mkdtemp(prefix="g3tc_")
+        tmpdirs.append(tmp)
+        work = os.path.join(tmp, "work")
+        os.makedirs(os.path.join(work, "img"))
+        v0 = os.path.join(tmp, "v0")
+        cats = {}
+        for name in ("main_real", "sdk_real"):
+            cat_c = os.path.join(tmp, "cat", name + ".cat.c")
+            cat_js = os.path.join(tmp, "cat", name + ".cat.json")
+            _write(cat_c, ("/* catalog %s */\n" % name).encode("ascii"))
+            _write(cat_js, b'{"identity": "%s"}' % name.encode("ascii"))
+            cats[name] = {"cat_c": cat_c, "cat_json": cat_js,
+                          "receipt": os.path.join(tmp, "cat",
+                                                  name + ".receipt.json"),
+                          "receipt_ok": False, "next_ctors": set(),
+                          "t_prepare": 0.0}
+        modules = [{"name": "main_real", "base": MOD_BASE,
+                    "image_size": 0x1000, "init_va": MOD_BASE + 0x100},
+                   {"name": "sdk_real", "base": SDK_BASE,
+                    "image_size": 0x1000, "init_va": SDK_BASE + 0x100}]
+        entries = {"main_real": {MOD_BASE + 0x100, MOD_BASE + 0x200},
+                   "sdk_real": {SDK_BASE + 0x100}}
+        targs = types.SimpleNamespace(python=sys.executable)
+        fake = FakeTool()
+        G.run = fake
+        prev = {}
+
+        def tcat():
+            return G.translate_catalog(REPO, targs, work, v0, modules,
+                                       entries, cats, prev)
+
+        imgs, metas, secs = tcat()
+        failures += check("first call: two table builds", len(fake.calls), 2)
+        failures += check("first call: each is a regenerate with a receipt",
+                          [("--verify-mode" in c and
+                            _arg(c, "--verify-mode") == "regenerate"
+                            and "--write-receipt" in c) for c in fake.calls],
+                          [True, True])
+        failures += check("imgs values are [cat_c, tab_c]",
+                          imgs["main_real"],
+                          [cats["main_real"]["cat_c"],
+                           os.path.join(work, "img", "main_real.tab.c")])
+        failures += check("first call: receipts recorded",
+                          (cats["main_real"]["receipt_ok"],
+                           cats["sdk_real"]["receipt_ok"],
+                           os.path.isfile(cats["main_real"]["receipt"])),
+                          (True, True, True))
+        failures += check("table metadata is returned per module",
+                          metas["sdk_real"]["name"], "sdk_real")
+        with open(os.path.join(work, "entries_main_real.json"),
+                  encoding="utf-8") as f:
+            failures += check("entries file is the sorted root list",
+                              json.load(f), sorted(entries["main_real"]))
+        fake.calls = []
+        imgs2, _metas2, secs2 = tcat()
+        failures += check("unchanged entries reuse the tables",
+                          (fake.calls, secs2),
+                          ([], {"main_real": 0.0, "sdk_real": 0.0}))
+        failures += check("reused imgs are the same paths",
+                          imgs2, imgs)
+        entries["sdk_real"].add(SDK_BASE + 0x200)
+        fake.calls = []
+        tcat()
+        failures += check("one changed module: only that table rebuilt",
+                          [_arg(c, "--name") for c in fake.calls],
+                          ["sdk_real"])
+        failures += check("rebuild after receipt is bound, not regenerated",
+                          (_arg(fake.calls[0], "--verify-mode"),
+                           "--receipt" in fake.calls[0],
+                           "--write-receipt" in fake.calls[0]),
+                          ("bound", True, False))
+        # A refreshed catalog (new bytes, receipt reset) must rebuild its
+        # table even though the entries did not change.
+        # The table is also bound to the catalog BYTES: changed bytes rebuild
+        # it even while the receipt still claims a valid regenerate.
+        _write(cats["main_real"]["cat_c"], b"/* catalog changed */\n")
+        fake.calls = []
+        tcat()
+        failures += check("changed catalog bytes: table rebuilt, bound",
+                          [(_arg(c, "--name"), _arg(c, "--verify-mode"))
+                           for c in fake.calls],
+                          [("main_real", "bound")])
+        _write(cats["main_real"]["cat_c"], b"/* catalog refreshed */\n")
+        cats["main_real"]["receipt_ok"] = False
+        fake.calls = []
+        tcat()
+        failures += check("refreshed catalog: table rebuilt, unchanged roots",
+                          [(_arg(c, "--name"), _arg(c, "--verify-mode"))
+                           for c in fake.calls],
+                          [("main_real", "regenerate")])
+        entries["main_real"].add(MOD_BASE + 0x400)
+        fake.refuse = {"main_real"}
+        fake.calls = []
+        failures += expect_driver_error_containing(
+            "table REFUSED is a DriverError with the REFUSED line",
+            tcat, "REFUSED partition-mismatch")
+        failures += check("table REFUSED never falls back to legacy",
+                          [_arg(c, "--name") for c in fake.calls],
+                          ["main_real"])
+        fake.refuse = set()
+
+        # The real run(): a non-zero exit keeps its stdout on the exception.
+        G.run = saved_run
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                G.run([sys.executable, "-c",
+                       "print('REFUSED probe'); raise SystemExit(2)"])
+                refused = None
+            except G.DriverError as exc:
+                refused = getattr(exc, "stdout", None)
+        failures += check("run() keeps the child's stdout on failure",
+                          refused, "REFUSED probe\n")
+
+        # prepare_catalog: frontend + selection + catalog, all faked.
+        G.run = fake
+        ptmp = tempfile.mkdtemp(prefix="g3pc_")
+        tmpdirs.append(ptmp)
+        pv0 = os.path.join(ptmp, "v0")
+        _write(os.path.join(pv0, "link", "main_real.flat"), b"\0" * 0x400)
+        _write(os.path.join(pv0, "link", "main_real.layout.json"), b"{}")
+        pwork = os.path.join(ptmp, "work")
+        pargs = types.SimpleNamespace(python=sys.executable, catalog_n=32)
+        pm = modules[0]
+        # FDE starts 0x100, 0x200, 0x300; slot order 0x100, 0x200.
+        fake.boundaries = [(0x100, 0x110), (0x200, 0x220), (0x300, 0x320)]
+        slots = [0x100, 0x200]
+        admitted_va = {MOD_BASE + 0x100, MOD_BASE + 0x104,
+                       MOD_BASE + 0x300}
+        fake.calls = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cat = G.prepare_catalog(REPO, pargs, pwork, pv0, pm, admitted_va,
+                                    slots)
+        starts = [w["start"] for w in cat["selection"]["windows"]]
+        failures += check("prepare: next ctor + admitted FDE roots",
+                          starts, [0x100, 0x200, 0x300])
+        failures += check("prepare: next_ctors is the first unadmitted slot",
+                          cat["next_ctors"], {0x200})
+        failures += check("prepare: non-FDE admitted offset adds no window",
+                          0x104 in starts, False)
+        failures += check("prepare: selection is fed to the catalog tool",
+                          _arg(fake.calls[-1], "--select"),
+                          "0x100,0x200,0x300")
+        failures += check("prepare: receipt starts unbound",
+                          (cat["receipt_ok"], cat["receipt"]),
+                          (False, os.path.join(pwork, "cat",
+                                               "main_real.cat.receipt.json")))
+        failures += check("prepare: prints the CATALOG line",
+                          buf.getvalue().count("CATALOG module=main_real "
+                                               "windows=3 next_ctors=1 "),
+                          1)
+        failures += check("prepare: selection written under work",
+                          os.path.isfile(os.path.join(
+                              pwork, "cat", "main_real.selection.json")),
+                          True)
+        fake.boundaries = [(0x100, 0x110)]
+        failures += expect_driver_error_containing(
+            "prepare: empty selection is refused",
+            lambda: G.prepare_catalog(REPO, pargs, pwork, pv0, pm, set(),
+                                      []),
+            "catalog selection is empty for main_real")
+    finally:
+        G.run = saved_run
+        for path in tmpdirs:
+            shutil.rmtree(path, ignore_errors=True)
+
+    # CLI guard: equivalence needs the catalog backend, before v0 is read.
+    gtmp = tempfile.mkdtemp(prefix="g3guard_")
+    try:
+        gwork = os.path.join(gtmp, "work")
+        gv0 = os.path.join(gtmp, "v0")
+        base_argv = ["--repo", REPO, "--work", gwork, "--v0-dir", gv0,
+                     "--vcvars", "x.bat"]
+        def guard_rc(extra):
+            # An escaped exception is a failed guard, not a pass.
+            try:
+                with contextlib.redirect_stdout(buf):
+                    return G.main(base_argv + extra)
+            except Exception as exc:                        # noqa: BLE001
+                return "raised %s" % type(exc).__name__
+
+        buf = io.StringIO()
+        rc = guard_rc(["--backend", "legacy", "--equivalence-check"])
+        failures += check("--equivalence-check with legacy returns 1", rc, 1)
+        failures += check("guard names the backend requirement",
+                          "requires --backend catalog" in buf.getvalue(),
+                          True)
+        failures += check("guard touches neither work nor v0",
+                          (os.path.exists(gwork), os.path.exists(gv0)),
+                          (False, False))
+        rc2 = guard_rc(["--equivalence-every", "2"])
+        rc3 = guard_rc(["--backend", "catalog", "--equivalence-check",
+                        "--equivalence-every", "3"])
+        failures += check("--equivalence-every with default backend is 1",
+                          rc2, 1)
+        failures += check("--equivalence-check conflicts with every 3",
+                          rc3, 1)
+        failures += check("guards never create the work tree",
+                          os.path.exists(gwork), False)
+    finally:
+        shutil.rmtree(gtmp, ignore_errors=True)
+
+    # Timing: the two new keys and the catalog backend name.
+    timing = {
+        "iteration": 3, "backend": "catalog", "roots": {"main_real": 2},
+        "t_translate": {"main_real": 0.0}, "t_bind": 0.0,
+        "t_emit_desc": 0.0, "t_compile": 0.0, "t_link": 0.0, "t_run": 0.0,
+        "t_classify": 0.0, "t_total": 1.0, "t_prepare": 0.5,
+        "t_equivalence": 0.25, "c_bytes": {"main_real": 10},
+        "obj_bytes": None, "exe_bytes": None, "steps": None, "stop": None,
+        "admitted": None,
+    }
+    failures += check("catalog timing record with new keys passes",
+                      timing_passes(timing), True)
+    failures += expect_driver_error(
+        "timing rejects a negative t_equivalence",
+        lambda: G.validate_timing_record(dict(timing, t_equivalence=-0.1)))
+    failures += expect_driver_error(
+        "timing rejects a negative t_prepare",
+        lambda: G.validate_timing_record(dict(timing, t_prepare=-1)))
+    no_prepare = dict(timing)
+    del no_prepare["t_prepare"]
+    failures += expect_driver_error(
+        "timing record missing t_prepare",
+        lambda: G.validate_timing_record(no_prepare))
+    failures += expect_driver_error(
+        "timing rejects an unknown backend",
+        lambda: G.validate_timing_record(dict(timing, backend="fast")))
+    return failures
+
+
 def main():
     failures = 0
     failures += check("clean return",
@@ -646,6 +1029,7 @@ def main():
         "t_translate": {"main_real": 0.25, "sdk_real": 1},
         "t_bind": 0.0, "t_emit_desc": 0.01, "t_compile": 1.5,
         "t_link": 0.0, "t_run": 0.5, "t_classify": 0.001, "t_total": 2.3,
+        "t_prepare": 0.0, "t_equivalence": 0.0,
         "c_bytes": {"main_real": 1024}, "obj_bytes": 4096, "exe_bytes": None,
         "steps": 12,
         "stop": {"code": 10, "src": 0x10201584B0, "target": 0x10200FA060,
@@ -656,7 +1040,8 @@ def main():
         "iteration": 1, "backend": "legacy", "roots": {},
         "t_translate": {}, "t_bind": 0.0, "t_emit_desc": 0.0,
         "t_compile": 0.0, "t_link": 0.0, "t_run": 0.0, "t_classify": 0.0,
-        "t_total": 0.0, "c_bytes": {}, "obj_bytes": None, "exe_bytes": 8192,
+        "t_total": 0.0, "t_prepare": 0.0, "t_equivalence": 0.0,
+        "c_bytes": {}, "obj_bytes": None, "exe_bytes": 8192,
         "steps": None, "stop": None, "admitted": None,
     }
     failures += check("valid timing record passes",
@@ -986,6 +1371,7 @@ def main():
         G._COMPILER_IDS.clear()
         shutil.rmtree(build_tmp, ignore_errors=True)
 
+    failures += catalog_backend_checks()
     if failures:
         print("FAIL: %d classification check(s)" % failures)
         return 1

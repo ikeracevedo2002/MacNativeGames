@@ -20,6 +20,15 @@ inputs are read-only; every generated image/object/log goes under --work.
 The probe never fabricates SVC success: an unhandled SVC is the typed BAD_HLE
 with its site and immediate. Exit 0 = real typed blocker, 2 = no blocker
 (clean return or follow limit), 1 = infrastructure/justification failure.
+
+Backends (plan step 1.2, D024 Stage C).  `--backend legacy` (default) is the
+translator path above.  `--backend catalog` builds, per module, a frozen
+candidate catalog (`g3_fde_emit.py catalog`, windows chosen by
+`g3_stage_c_select`) and a per-iteration authority table (`g3_fde_emit.py
+table`) that lists only the admitted closure.  `--equivalence-every K` also
+runs the legacy build of the SAME roots and compares the normalized stop and
+the STARTFAULTGPR lines.  Catalog bodies never become roots: a constructor
+slot is compiled, not authorized.
 """
 
 import sys
@@ -47,6 +56,7 @@ import aot_translate as T       # noqa: E402
 import g3_ctor_roots as CR      # noqa: E402
 import g3_init_reach as R       # noqa: E402
 import g3_local_switch as LS    # noqa: E402
+import g3_stage_c_select as SEL  # noqa: E402
 import g3_veneer_roots as VR    # noqa: E402
 import g4_romfs_config as RC    # noqa: E402
 
@@ -71,8 +81,9 @@ START_VA = 0x10200FA060
 # Required keys of every --timing-out record (one per completed iteration).
 TIMING_KEYS = ("iteration", "backend", "roots", "t_translate", "t_bind",
                "t_emit_desc", "t_compile", "t_link", "t_run", "t_classify",
-               "t_total", "c_bytes", "obj_bytes", "exe_bytes", "steps",
-               "stop", "admitted")
+               "t_total", "t_prepare", "t_equivalence", "c_bytes",
+               "obj_bytes", "exe_bytes", "steps", "stop", "admitted")
+BACKENDS = ("legacy", "catalog")
 
 
 class DriverError(Exception):
@@ -513,6 +524,140 @@ def translate(repo, args, work, v0, modules, entries):
     return imgs, metas, secs
 
 
+def prepare_catalog(repo, args, work, v0, m, entries_va, slots):
+    """Frozen candidate catalog for ONE module (plan step 1.2).
+
+    The Stage C selection is advice; it becomes a catalog only through
+    `g3_fde_emit.py catalog`, which re-derives every window from the flat.
+    FDE windows that start at an admitted root are added as well: those
+    bodies are already admitted, so compiling them keeps the table small.
+    """
+    t0 = time.perf_counter()
+    name = m["name"]
+    base = m["base"]
+    flat = os.path.join(v0, "link", name + ".flat")
+    layout = os.path.join(v0, "link", name + ".layout.json")
+    cdir = os.path.join(work, "cat")
+    os.makedirs(cdir, exist_ok=True)
+    manifest = os.path.join(cdir, name + ".manifest.json")
+    sel_path = os.path.join(cdir, name + ".selection.json")
+    cat_c = os.path.join(cdir, name + ".cat.c")
+    cat_json = os.path.join(cdir, name + ".cat.json")
+    receipt = os.path.join(cdir, name + ".cat.receipt.json")
+    for path in (manifest, sel_path, cat_c, cat_json, receipt):
+        if os.path.exists(path):
+            os.remove(path)
+    frontend = os.path.join(repo, "tools", "aot", "g3_fde_frontend.py")
+    emit = os.path.join(repo, "tools", "aot", "g3_fde_emit.py")
+    run_step([args.python, frontend, flat, layout, "--out", manifest,
+              "--name", name, "--base", hex(base)],
+             "g3_fde_frontend for %s" % name)
+    admitted = set(va - base for va in entries_va)
+    try:
+        with open(manifest, encoding="utf-8") as f:
+            doc = json.load(f)
+        bounds = SEL._boundary_map(doc)
+        with open(flat, "rb") as f:
+            flat_bytes = f.read()
+        info = SEL.LazyWindowInfo(flat_bytes, bounds, base)
+        selection = SEL.select_catalog_windows(doc, slots, admitted, info,
+                                               n=args.catalog_n)
+        have = set(w["start"] for w in selection["windows"])
+        for off in sorted(admitted):
+            if off in bounds and off not in have:
+                selection["windows"].append({
+                    "start": off, "end": bounds[off],
+                    "purpose": "admitted-root", "ctor_slot": None,
+                    "strata": sorted(info[off]["strata"])})
+        selection["windows"].sort(key=lambda w: w["start"])
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise DriverError("catalog selection for %s: %s" % (name, exc)) \
+            from exc
+    if not selection["windows"]:
+        raise DriverError("catalog selection is empty for %s" % name)
+    with open(sel_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(selection, indent=2, sort_keys=True) + "\n")
+    run_step([args.python, emit, "catalog", "--flat", flat, "--layout",
+              layout, "--guest-base", hex(base), "--name", name,
+              "--manifest", manifest, "--select", SEL.select_arg(selection),
+              "--out-c", cat_c, "--out-json", cat_json],
+             "g3_fde_emit catalog for %s" % name)
+    t_prepare = time.perf_counter() - t0
+    print("CATALOG module=%s windows=%d next_ctors=%d seconds=%.3f"
+          % (name, len(selection["windows"]), len(selection["next_ctors"]),
+             t_prepare))
+    return {"cat_c": cat_c, "cat_json": cat_json, "selection": selection,
+            "next_ctors": set(selection["next_ctors"]), "receipt": receipt,
+            "receipt_ok": False, "t_prepare": t_prepare}
+
+
+def _table_key(entries_path, cat):
+    """Reuse key: the entries file AND the catalog the table binds to."""
+    h = hashlib.sha256()
+    for path in (entries_path, cat["cat_c"], cat["cat_json"]):
+        h.update(sha256_file(path).encode("ascii") + b"\0")
+    return h.hexdigest()
+
+
+def translate_catalog(repo, args, work, v0, modules, entries, cats,
+                      prev_hash):
+    """Per-module authority tables for the catalog backend.
+
+    Same return shape as translate(); imgs[name] is [catalog .c, table .c].
+    `prev_hash` (updated in place) maps module -> the key of its last table.
+    A table is rebuilt unless its key is unchanged AND its catalog receipt is
+    valid; the first table of a catalog is a regenerate (writes the receipt),
+    later ones are bound to that receipt.  A refusal is never retried as
+    legacy.
+    """
+    imgs = {}
+    metas = {}
+    secs = {}
+    emit = os.path.join(repo, "tools", "aot", "g3_fde_emit.py")
+    for m in modules:
+        name = m["name"]
+        es = sorted(entries.get(name, set()))
+        if m["init_va"] not in es:
+            raise DriverError("%s: DT_INIT 0x%x missing from roots"
+                              % (name, m["init_va"]))
+        ep = os.path.join(work, "entries_%s.json" % name)
+        with open(ep, "w", encoding="utf-8") as f:
+            json.dump(es, f)
+        cat = cats[name]
+        tab = os.path.join(work, "img", name + ".tab.c")
+        meta = os.path.join(work, "img", name + ".meta.json")
+        imgs[name] = [cat["cat_c"], tab]
+        key = _table_key(ep, cat)
+        if (prev_hash.get(name) == key and cat["receipt_ok"]
+                and os.path.isfile(tab) and os.path.isfile(meta)):
+            secs[name] = 0.0
+        else:
+            t0 = time.perf_counter()
+            cmd = [args.python, emit, "table",
+                   "--flat", os.path.join(v0, "link", name + ".flat"),
+                   "--layout", os.path.join(v0, "link",
+                                            name + ".layout.json"),
+                   "--guest-base", hex(m["base"]), "--name", name,
+                   "--entries", ep, "--catalog-json", cat["cat_json"],
+                   "--catalog-c", cat["cat_c"], "--out-c", tab,
+                   "--out-json", meta,
+                   "--report", os.path.join(work, "img",
+                                            name + ".partition.json")]
+            if cat["receipt_ok"]:
+                cmd += ["--verify-mode", "bound", "--receipt",
+                        cat["receipt"]]
+            else:
+                cmd += ["--verify-mode", "regenerate", "--write-receipt",
+                        cat["receipt"]]
+            run_step(cmd, "g3_fde_emit table for %s" % name)
+            cat["receipt_ok"] = True
+            prev_hash[name] = key
+            secs[name] = time.perf_counter() - t0
+        with open(meta, encoding="utf-8") as f:
+            metas[name] = json.load(f)
+    return imgs, metas, secs
+
+
 def emit_desc(repo, args, work, v0, modules):
     desc = os.path.join(work, "real_desc_partial.c")
     image_map = {m["name"]: "aot_image_%s" % m["name"] for m in modules}
@@ -532,8 +677,31 @@ def run(cmd, **kw):
     if p.returncode != 0:
         sys.stdout.write(p.stdout)
         sys.stderr.write(p.stderr)
-        raise DriverError("command failed: %s" % (cmd,))
+        exc = DriverError("command failed: %s" % (cmd,))
+        # The child's stdout carries the typed REFUSED / NO_EH_FRAME_HDR line.
+        exc.stdout = p.stdout
+        raise exc
     return p
+
+
+def _refusal_text(stdout):
+    lines = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip()]
+    return "; ".join(lines) if lines else "no output"
+
+
+def run_step(cmd, what):
+    """run() whose DriverError names the tool's own REFUSED line."""
+    try:
+        return run(cmd)
+    except DriverError as exc:
+        raise DriverError("%s failed: %s"
+                          % (what, _refusal_text(getattr(exc, "stdout", "")))
+                          ) from exc
+
+
+def _paths(value):
+    """An image value is one .c path (legacy) or a list of paths (catalog)."""
+    return [value] if isinstance(value, str) else list(value)
 
 
 # Per-TU compile flags, in the order the single-cl build used them. The /I
@@ -948,6 +1116,108 @@ def make_ctor_decide(v0, modules, world, nnmain_va, sentinel, st, gprs, mm,
     return decide
 
 
+def ctor_slot_offsets(v0, modules, world, nnmain_va):
+    """DT_INIT_ARRAY targets per module, as IMAGE OFFSETS in array order.
+
+    AUDIT data only: it selects what the catalog COMPILES, never a root.  The
+    authority is built from each module's ORIGINAL world image, exactly as
+    make_ctor_decide does.  A module with no declared array (or whose array
+    is refused) gets [], which only narrows the catalog selection; the
+    runtime per-fault decision still refuses or admits as before.
+    """
+    out = {}
+    for m in modules:
+        cands = [im for im in world.images if im.base == m["base"]]
+        if len(cands) != 1:
+            raise DriverError("ctor slots: %d world images share module %s "
+                              "guest base 0x%x" % (len(cands), m["name"],
+                                                   m["base"]))
+        image = cands[0]
+        sha = hashlib.sha256(image.flat).hexdigest()
+        ctx = LS.Context(image.flat, image.layout, image.base, T.decode)
+        try:
+            auth = CR.Authority.build([image], {image.name: sha},
+                                      {image.name: ctx},
+                                      nnmain_va=nnmain_va,
+                                      sentinel=world.sentinel)
+        except (CR.CtorRefusal, LS.InputError):
+            out[m["name"]] = []
+            continue
+        except CR.CtorInputError as exc:
+            raise DriverError("ctor slot input: %s" % exc) from exc
+        array = auth.arrays.get(image.name)
+        out[m["name"]] = ([] if array is None else
+                          [slot.target - image.base for slot in array.slots])
+    return out
+
+
+def resolve_status(meta, status, src):
+    """Map a fault status to its metadata entry, or None.
+
+    Returns ("unsupported", entry) when exactly one unsupported entry has this
+    status AND pc == src, or ("switch", entry) for the one local-switch site
+    with this status.  Catalog and legacy statuses are both resolved here, so
+    a raw integer is never compared across the two namespaces.  More than one
+    matching entry is a DriverError (ambiguous metadata, never a first-hit).
+    """
+    hits = [("unsupported", u) for u in meta.get("unsupported", [])
+            if u["status"] == status and int(u["pc"], 16) == src]
+    hits += [("switch", s) for s in meta.get("local_switch_sites", [])
+             if s["status"] == status]
+    if not hits:
+        return None
+    if len(hits) > 1:
+        raise DriverError("ambiguous status %d at 0x%x: %d matching metadata "
+                          "entries" % (status, src, len(hits)))
+    return hits[0]
+
+
+def normalize_stop(st, metas, mm_name):
+    """Namespace-free view of one STOP for the equivalence gate.
+
+    `metas` maps module name -> table/legacy metadata; `mm_name` names the
+    module that owns the fault source (None: no metadata, raw status).  The
+    status becomes ("unsupported", pc) or ("switch", br_pc) when
+    resolve_status finds it, else the raw integer.  Every other field is kept
+    as is, so a different src or target still compares unequal.
+    """
+    if st is None:
+        return None
+    meta = metas.get(mm_name) if mm_name is not None else None
+    status = st["status"]
+    found = None if meta is None else resolve_status(meta, status, st["src"])
+    if found is None:
+        norm = status
+    elif found[0] == "unsupported":
+        norm = ("unsupported", int(found[1]["pc"], 16))
+    else:
+        norm = ("switch", int(found[1]["br_pc"], 16))
+    return {"code": st["code"], "src": st["src"], "target": st["target"],
+            "steps": st["steps"], "status": norm}
+
+
+def stop_gprs(out):
+    """The STARTFAULTGPR lines of one probe run, in order."""
+    return [ln for ln in out.splitlines() if ln.startswith("STARTFAULTGPR")]
+
+
+def equivalence_view(st, out, metas, modules):
+    """normalize_stop of st plus its GPR lines, for one run's comparison."""
+    mm = module_of(st["src"], modules) if st is not None else None
+    return {"stop": normalize_stop(st, metas, mm["name"] if mm else None),
+            "gprs": stop_gprs(out)}
+
+
+def catalog_exhausted(cat, admitted_offsets):
+    """True only when the catalog's next constructors are all admitted.
+
+    An empty next_ctors set is never exhausted: there is nothing to refresh
+    toward, so the catalog stays as it is.
+    """
+    nxt = cat["next_ctors"]
+    return bool(nxt) and all(off in admitted_offsets for off in nxt)
+
+
 def parse_stop(out):
     m = re.search(r"^STARTSTOP code=(-?\d+) src=0x([0-9a-f]+) "
                   r"target=0x([0-9a-f]+) status=(-?\d+) "
@@ -1009,8 +1279,8 @@ def validate_timing_record(rec):
         raise DriverError("timing record has unexpected keys %s" % extra)
     if not _is_int(rec["iteration"]):
         raise DriverError("timing iteration must be int")
-    if not isinstance(rec["backend"], str):
-        raise DriverError("timing backend must be str")
+    if rec["backend"] not in BACKENDS:
+        raise DriverError("timing backend must be one of %s" % (BACKENDS,))
     if rec["steps"] is not None and not _is_int(rec["steps"]):
         raise DriverError("timing steps must be int or None")
     for key, check, what in (("roots", _is_nonneg_int, "int"),
@@ -1022,7 +1292,7 @@ def validate_timing_record(rec):
             raise DriverError("timing %s must be a dict of str -> %s"
                               % (key, what))
     for key in ("t_bind", "t_emit_desc", "t_compile", "t_link", "t_run",
-                "t_classify", "t_total"):
+                "t_classify", "t_total", "t_prepare", "t_equivalence"):
         if not _is_secs(rec[key]):
             raise DriverError("timing %s must be a non-negative number"
                               % key)
@@ -1056,23 +1326,73 @@ def write_timing(path, records):
     os.replace(tmp, path)
 
 
-def iteration_record(work, iteration, entries, imgs, exe, st, t, admitted):
+def iteration_record(work, iteration, entries, imgs, exe, st, t, admitted,
+                     backend="legacy"):
     """One TIMING_KEYS record from main()'s per-phase clocks (seconds)."""
     stop = None
     if st is not None:
         stop = {k: st[k] for k in ("code", "src", "target", "status")}
     return validate_timing_record(dict(
-        iteration=iteration, backend="legacy",
+        iteration=iteration, backend=backend,
         roots={n: len(v) for n, v in entries.items()},
         t_translate=t["translate"], t_bind=t["bind"],
         t_emit_desc=t["emit_desc"], t_compile=t["compile"],
         t_link=t["link"], t_run=t["run"], t_classify=t["classify"],
-        t_total=t["total"],
-        c_bytes={n: os.path.getsize(p) for n, p in imgs.items()},
+        t_total=t["total"], t_prepare=t["prepare"],
+        t_equivalence=t["equivalence"],
+        c_bytes={n: sum(os.path.getsize(p) for p in _paths(v))
+                 for n, v in imgs.items()},
         obj_bytes=LAST_BUILD["obj_bytes"],
         exe_bytes=os.path.getsize(exe) if os.path.exists(exe) else None,
         steps=st["steps"] if st is not None else None,
         stop=stop, admitted=admitted))
+
+
+def run_equivalence(repo, args, work, v0, modules, entries, desc, config_c,
+                    cat_out, cat_st, cat_metas):
+    """Legacy build and run of the SAME roots, compared with the catalog run.
+
+    Everything legacy lives under work/eq (its own img/, obj/, exe and logs);
+    translate() and build() only touch the directory they are given.  The
+    shared desc and config_c are reused.  -> dict with secs, error (a message
+    for an infrastructure failure), equal, catalog and legacy views.
+    """
+    t0 = time.perf_counter()
+    eqwork = os.path.join(work, "eq")
+    os.makedirs(os.path.join(eqwork, "img"), exist_ok=True)
+    legacy_imgs, legacy_metas, _secs = translate(repo, args, eqwork, v0,
+                                                 modules, entries)
+    exe = os.path.join(eqwork, "aot_g3_start_probe.exe")
+    saved = dict(LAST_BUILD)
+    built, _tc, _tl = build(repo, eqwork, args, desc, legacy_imgs, exe,
+                            config_c)
+    LAST_BUILD.update(saved)   # the catalog iteration keeps its own counters
+    out = {"secs": None, "error": None, "equal": False, "catalog": None,
+           "legacy": None}
+    if not built:
+        out["error"] = "equivalence legacy build failed"
+    else:
+        p = subprocess.run([exe, os.path.join(v0, "link")],
+                           capture_output=True, text=True)
+        with open(os.path.join(eqwork, "run_start.log"), "w",
+                  encoding="utf-8") as lf:
+            lf.write(p.stdout)
+            lf.write(p.stderr)
+        if p.returncode != 0:
+            sys.stderr.write(p.stderr)
+            out["error"] = "equivalence legacy probe exited %d" % p.returncode
+        else:
+            leg_st = parse_stop(p.stdout)
+            if leg_st is None:
+                out["error"] = "equivalence legacy run: no STARTSTOP line"
+            else:
+                out["catalog"] = equivalence_view(cat_st, cat_out,
+                                                  cat_metas, modules)
+                out["legacy"] = equivalence_view(leg_st, p.stdout,
+                                                 legacy_metas, modules)
+                out["equal"] = out["catalog"] == out["legacy"]
+    out["secs"] = time.perf_counter() - t0
+    return out
 
 
 def main(argv):
@@ -1091,7 +1411,27 @@ def main(argv):
     ap.add_argument("--romfs-required-overlay-dir")
     ap.add_argument("--romfs-no-overlays", action="store_true")
     ap.add_argument("--timing-out")
+    ap.add_argument("--backend", choices=BACKENDS, default="legacy")
+    ap.add_argument("--catalog-n", dest="catalog_n", type=int, default=32)
+    ap.add_argument("--equivalence-every", dest="equivalence_every",
+                    type=int, default=None)
+    ap.add_argument("--equivalence-check", dest="equivalence_check",
+                    action="store_true")
     args = ap.parse_args(argv)
+    # Argument guards come before any path is touched (v0 is never read).
+    if args.equivalence_check:
+        if args.equivalence_every not in (None, 1):
+            return fail("--equivalence-check means --equivalence-every 1; "
+                        "the two options conflict")
+        args.equivalence_every = 1
+    if args.equivalence_every is None:
+        args.equivalence_every = 0
+    if args.equivalence_every < 0:
+        return fail("--equivalence-every must be >= 0")
+    if args.equivalence_every and args.backend != "catalog":
+        return fail("--equivalence-* requires --backend catalog")
+    if args.catalog_n < 1:
+        return fail("--catalog-n must be at least 1")
     repo = str(Path(args.repo).resolve())
     work = str(Path(args.work).resolve())
     v0 = str(Path(args.v0_dir).resolve())
@@ -1216,25 +1556,63 @@ def main(argv):
         # Capstone evidence that the blocker site really is an SVC and what
         # immediate it carries (never guess a mnemonic from the fault code).
         blocker = None
+        # Catalog backend only (legacy never computes any of this).
+        slot_offsets = {}
+        if args.backend == "catalog":
+            slot_offsets = ctor_slot_offsets(v0, modules, world, nnmain_va)
+        cats = {}                  # module -> current frozen catalog
+        cat_prev_hash = {}         # module -> reuse key of its last table
+        catalog_refreshes = {}
+
+        def refresh_after_root(va, t):
+            """Re-prepare the owner's catalog once its next ctors are in."""
+            owner = module_of(va, modules)
+            name = owner["name"]
+            admitted_off = set(v - owner["base"] for v in by_mod[name])
+            if not catalog_exhausted(cats[name], admitted_off):
+                return
+            cats[name] = prepare_catalog(repo, args, work, v0, owner,
+                                         set(by_mod[name]),
+                                         slot_offsets.get(name, []))
+            catalog_refreshes[name] = catalog_refreshes.get(name, 0) + 1
+            print("CATALOG_REFRESH module=%s n=%d"
+                  % (name, catalog_refreshes[name]))
+            t["prepare"] += cats[name]["t_prepare"]
 
         def done(admitted):
             """Close this iteration's clocks; record it when timing is on."""
+            if admitted is not None and args.backend == "catalog":
+                refresh_after_root(admitted["va"], t)
             now = time.perf_counter()
             t["classify"] = now - t["cls0"]
             t["total"] = now - t["iter"]
             if timing_out:
                 timing.append(iteration_record(work, iteration, entries, imgs,
-                                               exe, st, t, admitted))
+                                               exe, st, t, admitted,
+                                               backend=args.backend))
                 write_timing(timing_out, timing)
 
         for iteration in range(args.max_iterations):
             print("== iteration %d" % iteration)
-            t = {"iter": time.perf_counter()}
+            t = {"iter": time.perf_counter(), "prepare": 0.0,
+                 "equivalence": 0.0}
             entries = {}
             for name, vals in by_mod.items():
                 entries[name] = set(vals)
-            imgs, metas, t["translate"] = translate(repo, args, work, v0,
-                                                    modules, entries)
+            if args.backend == "catalog":
+                for m in modules:
+                    if m["name"] not in cats:
+                        cats[m["name"]] = prepare_catalog(
+                            repo, args, work, v0, m,
+                            set(by_mod.get(m["name"], {})),
+                            slot_offsets.get(m["name"], []))
+                        t["prepare"] += cats[m["name"]]["t_prepare"]
+                imgs, metas, t["translate"] = translate_catalog(
+                    repo, args, work, v0, modules, entries, cats,
+                    cat_prev_hash)
+            else:
+                imgs, metas, t["translate"] = translate(repo, args, work, v0,
+                                                        modules, entries)
             t0 = time.perf_counter()
             if veneer_audit:
                 # Bind every proved flat SHA to the compiled image metadata
@@ -1271,10 +1649,28 @@ def main(argv):
             if p.returncode != 0:
                 sys.stderr.write(p.stderr)
                 return fail("probe exited %d" % p.returncode)
-            t["cls0"] = time.perf_counter()
             st = parse_stop(p.stdout)
             if st is None:
                 return fail("no STARTSTOP line")
+            if args.equivalence_every and \
+                    iteration % args.equivalence_every == 0:
+                eq = run_equivalence(repo, args, work, v0, modules, entries,
+                                     desc, config_c, p.stdout, st, metas)
+                t["equivalence"] = eq["secs"]
+                if eq["error"]:
+                    return fail(eq["error"])
+                if not eq["equal"]:
+                    with open(os.path.join(work, "result.json"), "w",
+                              encoding="utf-8") as f:
+                        json.dump({"kind": "equivalence_mismatch",
+                                   "iteration": iteration,
+                                   "catalog": eq["catalog"],
+                                   "legacy": eq["legacy"]},
+                                  f, indent=2, sort_keys=True)
+                    return fail("equivalence mismatch at iteration %d"
+                                % iteration)
+                print("EQUIV iteration=%d ok" % iteration)
+            t["cls0"] = time.perf_counter()
             mm = module_of(st["src"], modules)
             if mm is not None:
                 with open(os.path.join(v0, "link", mm["name"] + ".flat"),
@@ -1391,12 +1787,12 @@ def main(argv):
             elif st["code"] == 16:
                 if mm is None:
                     return fail("UNSUPPORTED src outside every image")
-                table = metas[mm["name"]]["unsupported"]
-                hit = [u for u in table if u["status"] == st["status"]]
-                if not hit or int(hit[0]["pc"], 16) != st["src"]:
+                found = resolve_status(metas[mm["name"]], st["status"],
+                                       st["src"])
+                if found is None or found[0] != "unsupported":
                     return fail("UNSUPPORTED status %d does not match offline "
                                 "metadata at 0x%x" % (st["status"], st["src"]))
-                u = hit[0]
+                u = found[1]
                 print("FIRST BLOCKER unsupported image=%s pc=%s word=%s "
                       "reason=%s" % (mm["name"], u["pc"], u["word"],
                                      u["reason"]))
@@ -1457,6 +1853,11 @@ def main(argv):
             path = os.path.join(work, rel)
             if os.path.exists(path):
                 result["files"][rel] = sha256_file(path)
+        if args.backend == "catalog":
+            for name in sorted(imgs):
+                for path in _paths(imgs[name]):
+                    rel = os.path.relpath(path, work).replace(os.sep, "/")
+                    result["files"][rel] = sha256_file(path)
         if ctor_audit:
             result["ctor_audit"] = {
                 "file": "ctor_audit.json",
