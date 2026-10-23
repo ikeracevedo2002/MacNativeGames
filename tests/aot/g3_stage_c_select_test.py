@@ -16,8 +16,8 @@ values here):
     ldadd x0,x1,[x2] (+lse) f8200041
 
 Covered:
-  * next_ctors order, the admitted cut (LAST admitted slot, duplicates before
-    and after it), the no-admitted case;
+  * next_ctors order, the admitted cut (FIRST not-admitted slot; a duplicate or
+    later admitted target never moves it), the no-admitted case;
   * no_fde targets go to no_fde_targets, never to windows;
   * BFS depth bound (a chain of six callees adds four levels), max_windows cap,
     and a max_windows smaller than the next constructors is refused;
@@ -121,11 +121,11 @@ def next_ok(selection, expected):
 # ------------------------------------------------------------- selector cases
 
 def cases_next_ctors():
-    # Admitted cut: duplicates before the cut, a duplicate after it, and an
-    # admitted target in the middle.  Expected next ctors are [W4,W5,W6].
+    # Admitted cut: an admitted prefix, duplicates after it.  Expected next
+    # ctors are [W4,W5,W6] from slot indices 4, 6, 7.
     slots = [W(1), W(2), W(2), W(3), W(4), W(4), W(5), W(6), W(7), W(8)]
-    sel = S.select_catalog_windows(MANIFEST, slots, [W(3)], table(), n=3,
-                                   depth=0, extra_per_stratum=0)
+    sel = S.select_catalog_windows(MANIFEST, slots, [W(1), W(2), W(3)],
+                                   table(), n=3, depth=0, extra_per_stratum=0)
     check(next_ok(sel, [W(4), W(5), W(6)]),
           "next_ctors follow the admitted cut in array order: %r"
           % sel["next_ctors"])
@@ -135,13 +135,22 @@ def cases_next_ctors():
     check(all(w["purpose"] == "next-ctor" for w in sel["windows"]),
           "every window in that run is a next-ctor window")
 
-    # Two occurrences of the admitted target: the cut is at the LAST one, so
-    # the W2 before it is skipped (a first-occurrence cut would give [W2,W4]).
-    slots2 = [W(1), W(3), W(2), W(3), W(4)]
-    sel2 = S.select_catalog_windows(MANIFEST, slots2, [W(3)], table(), n=3,
+    # A target admitted out of order (W3, e.g. by an STT_FUNC follow) must not
+    # move the cut: the loop still has to reach W1 and W2 first.
+    sel1 = S.select_catalog_windows(MANIFEST, slots, [W(3)], table(), n=3,
                                     depth=0, extra_per_stratum=0)
-    check(next_ok(sel2, [W(4)]),
-          "admitted cut uses the LAST admitted slot, not the first: %r"
+    check(next_ok(sel1, [W(1), W(2), W(4)]),
+          "an out-of-order admitted target does not skip earlier slots: %r"
+          % sel1["next_ctors"])
+
+    # A duplicate of an admitted target later in the array: the cut is at the
+    # FIRST not-admitted slot, so W2 is kept (a last-admitted-slot cut would
+    # skip it and give only [W4]).
+    slots2 = [W(1), W(3), W(2), W(3), W(4)]
+    sel2 = S.select_catalog_windows(MANIFEST, slots2, [W(1), W(3)], table(),
+                                    n=3, depth=0, extra_per_stratum=0)
+    check(next_ok(sel2, [W(2), W(4)]),
+          "a later duplicate of an admitted target does not move the cut: %r"
           % sel2["next_ctors"])
 
     # No admitted root: from the beginning, duplicates collapsed.
@@ -279,7 +288,8 @@ def cases_negative_control():
 
     S._pick_next = ignores_admitted
     try:
-        mutant = S.select_catalog_windows(MANIFEST, slots, [W(3)], table(),
+        mutant = S.select_catalog_windows(MANIFEST, slots,
+                                          [W(1), W(2), W(3)], table(),
                                           n=3, depth=0, extra_per_stratum=0)
     finally:
         S._pick_next = original
@@ -287,10 +297,33 @@ def cases_negative_control():
     check(detected, "NEGATIVE CONTROL: the ignores-admitted selector was NOT "
                     "detected by the next_ctors check (got %r)"
           % mutant["next_ctors"])
-    check(next_ok(S.select_catalog_windows(MANIFEST, slots, [W(3)], table(),
+    check(next_ok(S.select_catalog_windows(MANIFEST, slots,
+                                           [W(1), W(2), W(3)], table(),
                                            n=3, depth=0, extra_per_stratum=0),
                   expected),
           "the restored selector passes the same next_ctors check")
+
+    # A last-admitted-slot cut (the reviewed bug) skips W2 when a duplicate of
+    # an admitted target follows it; the duplicate case must catch it.
+    original_cut = S._cut_index
+
+    def last_admitted_cut(slots_, admitted_):
+        cut = 0
+        for index, target in enumerate(slots_):
+            if target in admitted_:
+                cut = index + 1
+        return cut
+
+    S._cut_index = last_admitted_cut
+    try:
+        mutant2 = S.select_catalog_windows(
+            MANIFEST, [W(1), W(3), W(2), W(3), W(4)], [W(1), W(3)], table(),
+            n=3, depth=0, extra_per_stratum=0)
+    finally:
+        S._cut_index = original_cut
+    check(not next_ok(mutant2, [W(2), W(4)]),
+          "NEGATIVE CONTROL: a last-admitted-slot cut was NOT detected (got %r)"
+          % mutant2["next_ctors"])
 
 
 # ------------------------------------------------------------------- scanner

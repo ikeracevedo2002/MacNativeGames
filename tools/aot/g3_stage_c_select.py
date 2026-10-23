@@ -183,12 +183,17 @@ def _boundary_map(manifest):
 
 
 def _cut_index(slots, admitted):
-    """Index just after the LAST slot whose target is admitted; 0 if none."""
-    cut = 0
+    """Index of the FIRST slot whose target is not admitted.
+
+    The guest loop walks the array in order, so that slot is the next one it
+    can fault on.  A target admitted for another reason (a duplicate slot, an
+    STT_FUNC follow) later in the array must not move the cut past slots the
+    loop has not reached yet.  len(slots) when every target is admitted.
+    """
     for index, target in enumerate(slots):
-        if target in admitted:
-            cut = index + 1
-    return cut
+        if target not in admitted:
+            return index
+    return len(slots)
 
 
 def _pick_next(slots, admitted, n):
