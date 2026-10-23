@@ -200,6 +200,9 @@ Criterio de **adopción**. Deben cumplirse los tres:
 - (a) 0 desigualdades en todas las comprobaciones de equivalencia;
 - (b) todos los negativos existentes y nuevos rechazados, con `infra=0`;
 - (c) la mediana de `t_total` por iteración baja al menos un 50 % frente a la línea base legacy del Paso 1.1.
+  **Reformulado 2026-10-23 (decisión del usuario):** (c) pasa a ser el tiempo absoluto medido por
+  constructor admitido, informado junto a la línea base, sin umbral del 50 %. Motivo: `run` (Start
+  completo) domina y limita la mejora alcanzable; ver `docs/evidence/stage-c-measurement.md`.
 
 Si se cumple:
 

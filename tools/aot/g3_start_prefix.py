@@ -914,7 +914,8 @@ def build(repo, work, args, desc, images, exe, config_c):
                 os.path.join(repo, "tests", "aot", "g4_romfs_start_hle.c"),
                 os.path.join(repo, "src", "romfs_provider.c"),
                 os.path.join(repo, "src", "romfs_file_win.c"),
-                os.path.join(repo, "src", "host_random.c"), desc, config_c]
+                os.path.join(repo, "src", "host_random.c"),
+                os.path.join(repo, "src", "host_sha256.c"), desc, config_c]
                + _flatten_images(images)
                + [os.path.join(repo, s) for s in CORE])
     # One spelling per file: CORE uses '/' and os.path.join adds '\' on

@@ -40,6 +40,8 @@ and manifest names are never normalized or rewritten.
 
 ## Verification contract
 
+- Since 2026-10-23 the image/overlay digests use the host CNG SHA-256 (`src/host_sha256.c`);
+  the index uses `aot_sha256`. Both are FIPS 180-4; the probe checks they agree.
 - **Always full verify.** This is Mac's forced-full path. Mac's proof-cache
   records are neither trusted nor written, and the optional whole-image mmap
   read accelerator is not ported. Those omissions remove startup accelerators,

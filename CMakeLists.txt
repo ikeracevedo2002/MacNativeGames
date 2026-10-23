@@ -114,6 +114,37 @@ target_include_directories(host_random PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(host_random PRIVATE /W4 /WX)
 target_link_libraries(host_random PUBLIC bcrypt)
 
+# Narrow host SHA-256 (CNG) for bulk public data: the RomFS image verification
+# (D020) hashes 17 GB on every init. Must equal src/aot/aot_sha256 exactly.
+add_library(host_sha256 STATIC src/host_sha256.c)
+target_include_directories(host_sha256 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(host_sha256 PRIVATE /W4 /WX)
+target_link_libraries(host_sha256 PUBLIC bcrypt)
+
+add_executable(host_sha256_probe
+    tests/host_sha256_probe.c
+    src/aot/aot_sha256.c
+)
+target_include_directories(host_sha256_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(host_sha256_probe PRIVATE host_sha256)
+target_compile_options(host_sha256_probe PRIVATE /W4 /WX)
+add_test(NAME host_sha256 COMMAND host_sha256_probe "${CMAKE_BINARY_DIR}")
+
+# Wrong backend (drops the last byte of every update): run by the shared
+# native mutant driver below, it must fail first on the NIST "abc" vector.
+add_executable(host_sha256_mut_drop_last_byte
+    tests/host_sha256_probe.c
+    src/host_sha256.c
+    src/aot/aot_sha256.c
+)
+target_include_directories(host_sha256_mut_drop_last_byte PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(host_sha256_mut_drop_last_byte PRIVATE
+    MN_HOST_SHA256_MUT_DROP_LAST_BYTE)
+target_link_libraries(host_sha256_mut_drop_last_byte PRIVATE bcrypt)
+target_compile_options(host_sha256_mut_drop_last_byte PRIVATE /W4 /WX)
+
 # Deterministic backend test: includes host_random.c with a fake private
 # compile-time provider, so it must not link the real host_random object.
 add_executable(host_random_backend_probe tests/aot/host_random_backend_probe.c)
@@ -219,6 +250,7 @@ add_library(romfs_provider STATIC
 target_include_directories(romfs_provider PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(romfs_provider PRIVATE /W4 /WX)
+target_link_libraries(romfs_provider PUBLIC host_sha256)
 
 # Hermetic fixture probe: tiny synthetic index/image/parts/overlays written to
 # an EXTERNAL directory (the build dir), with independently pinned SHA-256
@@ -249,6 +281,7 @@ foreach(mut SKIP_INDEX_HASH SKIP_IMAGE_HASH)
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(romfs_provider_mut_${mut_lc} PRIVATE
         MN_ROMFS_MUT_${mut})
+    target_link_libraries(romfs_provider_mut_${mut_lc} PRIVATE host_sha256)
     target_compile_options(romfs_provider_mut_${mut_lc} PRIVATE /W4 /WX)
     list(APPEND ROMFS_MUTANT_TARGETS "$<TARGET_FILE:romfs_provider_mut_${mut_lc}>")
 endforeach()
@@ -267,6 +300,13 @@ add_test(NAME romfs_provider_mutants
         "$<TARGET_FILE:romfs_provider_mut_skip_image_hash>"
         "same-size changed image is rejected")
 set_tests_properties(romfs_provider_mutants PROPERTIES TIMEOUT 180)
+
+add_test(NAME host_sha256_mutants
+    COMMAND romfs_provider_mutant_driver "${CMAKE_BINARY_DIR}"
+        "$<TARGET_FILE:host_sha256_probe>"
+        "$<TARGET_FILE:host_sha256_mut_drop_last_byte>"
+        "NIST abc")
+set_tests_properties(host_sha256_mutants PROPERTIES TIMEOUT 120)
 
 # ---- Early-G4 RomFS Start adapter (D020) --------------------------------
 #
@@ -316,6 +356,7 @@ foreach(pair "SKIP_INIT|success reports one successful HOSTCALL"
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(g4_romfs_start_hle_mut_${mut_lc} PRIVATE
         MN_G4_ROMFS_MUT_${mut})
+    target_link_libraries(g4_romfs_start_hle_mut_${mut_lc} PRIVATE host_sha256)
     target_compile_options(g4_romfs_start_hle_mut_${mut_lc} PRIVATE /W4 /WX)
     list(APPEND G4_ROMFS_MUTANT_ARGS
         "$<TARGET_FILE:g4_romfs_start_hle_mut_${mut_lc}>" "${label}")

@@ -738,6 +738,14 @@ decision does not close G3, alter its exit condition or mark G4 complete. The ve
 rebuilt in this narrow phase, and no existing AOT/G1/G2/G3 source or test row
 was modified by it (the provider rows are additive and not gated on AOT).
 
+Amendment (2026-10-23, user-approved): the image and overlay digests are computed with the
+host CNG SHA-256 (`src/host_sha256.{h,c}`, hardware accelerated) instead of the portable
+`aot_sha256`; the index keeps `aot_sha256`. Full verification on every init is unchanged.
+Evidence: `host_sha256` (NIST vectors, 4,100-message differential against `aot_sha256` with
+random chunking), `host_sha256_mutants` (a backend dropping one byte is rejected), the
+existing provider/adapter tests and mutants; on the real 1.0.0 image the Start run still reaches
+READY with 304,207 files and `run` fell from ~41 s to 9-12 s per Start.
+
 ## D021 — Narrow offline veneer root inside G3 (Start-prefix follow seam)
 
 **Status:** Candidate (proof frozen; wiring implemented and hermetically tested
@@ -1039,6 +1047,18 @@ that only a successful `--verify-mode regenerate --write-receipt` run writes. Bo
 re-derivation and catalog regeneration, so it is a hash check, not a regeneration, and it is valid only for
 the toolchain state that wrote the receipt. Pending Windows validation (`aot_g3_fde_emit` and the CTest
 battery); the hermetic `aot_g3_fde_emit_receipt` covers only the Linux-side logic.
+
+Stage C evidence (Windows, 2026-10-23; details `docs/evidence/stage-c-measurement.md`): the catalog
+backend (`g3_start_prefix.py --backend catalog`) ran 8/8 iterations with `--equivalence-check`
+OK twice (before and after the RomFS hash change), 0 refusals, 0 partition mismatches, admission
+order identical to legacy. Gate 1.6(c) restated by user decision: instead of >= 50 % lower median
+`t_total`, the catalog backend is accepted on (a) equivalence, (b) negatives rejected and (c) a
+measured, reported absolute time per admitted constructor. Measured steady state per admission:
+legacy median 22.6 s, catalog 20.8 s without the equivalence re-run (about 8 % faster; table step
+4.6 s vs translate 9.2 s, but the catalog run's Start is ~1.5 s slower, unexplained). The gain is
+marginal; the dominant remaining costs are rerunning Start (~10-12 s) and recomputing the main
+closure (~4.5 s). D008 stays OPEN: the plan's D008 candidate also needs the generated-code
+microbench, which has not been run.
 
 Consequences: G3 constructor progress is pursued by the frontend/build experiment (PORTING_PLAN Phase 2)
 before any new root heuristic. No exit condition changes.

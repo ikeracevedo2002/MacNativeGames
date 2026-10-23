@@ -1206,12 +1206,12 @@ def main():
         def rpath(rel):
             return os.path.join(repo, *rel.split("/"))
 
-        rel_six = ["tests/aot/aot_g3_start_probe.c",
+        rel_fixed = ["tests/aot/aot_g3_start_probe.c",
                    "tests/aot/g3_start_hle.c",
                    "tests/aot/g4_romfs_start_hle.c",
                    "src/romfs_provider.c", "src/romfs_file_win.c",
-                   "src/host_random.c"]
-        for rel in rel_six + list(G.CORE):
+                   "src/host_random.c", "src/host_sha256.c"]
+        for rel in rel_fixed + list(G.CORE):
             _write(rpath(rel), ("/* %s */\n" % rel).encode("ascii"))
         desc = os.path.join(build_tmp, "gen", "real_desc.c")
         config_c = os.path.join(build_tmp, "gen", "romfs_config.c")
@@ -1225,7 +1225,7 @@ def main():
                   "main_real": [img("main_a.c"), img("main_b.c")]}
         for p in G._flatten_images(images):
             _write(p, ("/* %s */\n" % os.path.basename(p)).encode("ascii"))
-        sources = ([rpath(r) for r in rel_six] + [desc, config_c]
+        sources = ([rpath(r) for r in rel_fixed] + [desc, config_c]
                    + [img("main_a.c"), img("main_b.c"), img("sdk.c")]
                    + [rpath(c) for c in G.CORE])
         n = len(sources)
@@ -1319,7 +1319,7 @@ def main():
         # 4. a cached object whose bytes were corrupted is recompiled.
         idx = read_index()
         key_of = {v["source"]: k for k, v in idx.items()}
-        probe_key = key_of[rpath(rel_six[0])]
+        probe_key = key_of[rpath(rel_fixed[0])]
         _write(obj_of(probe_key), b"CORRUPT")
         fake.events = []
         (ok, tc, tl), out = run_build()

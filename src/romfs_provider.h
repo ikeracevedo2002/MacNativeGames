@@ -90,7 +90,8 @@ typedef enum {
     ROMFS_PROVIDER_ERR_READ = 22,             /* host read failure */
     ROMFS_PROVIDER_ERR_NOT_FOUND = 23,
     ROMFS_PROVIDER_ERR_ALLOCATION = 24,
-    ROMFS_PROVIDER_ERR_IMAGE_CHANGED = 25   /* identity/metadata moved */
+    ROMFS_PROVIDER_ERR_IMAGE_CHANGED = 25,  /* identity/metadata moved */
+    ROMFS_PROVIDER_ERR_HASH = 26            /* host SHA-256 backend failed */
 } romfs_provider_status;
 
 typedef struct {

@@ -20,6 +20,7 @@
 #include "romfs_provider.h"
 
 #include "aot/aot_sha256.h"
+#include "host_sha256.h"
 #include "romfs_file_win.h"
 
 #include <stdio.h>
@@ -256,13 +257,28 @@ static romfs_provider_status image_read_at(const RomfsProviderStage *s,
     return ROMFS_PROVIDER_OK;
 }
 
+/* Bulk hashing uses the host SHA-256 (CNG, hardware accelerated): full
+ * verification of a 17 GB image is mandatory on every init (D020), so its
+ * cost is paid on every Start. Digests are identical to aot_sha256
+ * (tests/host_sha256_probe.c); the small index keeps aot_sha256. */
+static romfs_provider_status hash_status(host_sha256_result r)
+{
+    if (r == HOST_SHA256_OK) return ROMFS_PROVIDER_OK;
+    if (r == HOST_SHA256_ERR_ALLOCATION) return ROMFS_PROVIDER_ERR_ALLOCATION;
+    return ROMFS_PROVIDER_ERR_HASH;
+}
+
 static romfs_provider_status hash_image(const RomfsProviderStage *s,
                                         uint8_t out[32])
 {
-    AotSha256 ctx;
+    HostSha256 *ctx = NULL;
     uint8_t *buffer = (uint8_t *)malloc(ROMFS_HASH_BUFFER_BYTES);
     if (!buffer) return ROMFS_PROVIDER_ERR_ALLOCATION;
-    aot_sha256_init(&ctx);
+    romfs_provider_status begin = hash_status(host_sha256_begin(&ctx));
+    if (begin != ROMFS_PROVIDER_OK) {
+        free(buffer);
+        return begin;
+    }
     uint64_t done = 0;
     romfs_provider_status result = ROMFS_PROVIDER_OK;
     while (done < s->image_size) {
@@ -275,10 +291,14 @@ static romfs_provider_status hash_image(const RomfsProviderStage *s,
             result = ROMFS_PROVIDER_ERR_IMAGE_READ; /* short read */
             break;
         }
-        aot_sha256_update(&ctx, buffer, (size_t)got);
+        result = hash_status(host_sha256_update(ctx, buffer, (size_t)got));
+        if (result != ROMFS_PROVIDER_OK) break;
         done += got;
     }
-    if (result == ROMFS_PROVIDER_OK) aot_sha256_final(&ctx, out);
+    if (result == ROMFS_PROVIDER_OK)
+        result = hash_status(host_sha256_finish(ctx, out));
+    else
+        host_sha256_abort(ctx);
     free(buffer);
     return result;
 }
@@ -287,10 +307,14 @@ static romfs_provider_status hash_image_range(const RomfsProviderStage *s,
                                               uint64_t offset, uint64_t size,
                                               uint8_t out[32])
 {
-    AotSha256 ctx;
+    HostSha256 *ctx = NULL;
     uint8_t *buffer = (uint8_t *)malloc(ROMFS_HASH_BUFFER_BYTES);
     if (!buffer) return ROMFS_PROVIDER_ERR_ALLOCATION;
-    aot_sha256_init(&ctx);
+    romfs_provider_status begin = hash_status(host_sha256_begin(&ctx));
+    if (begin != ROMFS_PROVIDER_OK) {
+        free(buffer);
+        return begin;
+    }
     uint64_t done = 0;
     romfs_provider_status result = ROMFS_PROVIDER_OK;
     while (done < size) {
@@ -303,10 +327,14 @@ static romfs_provider_status hash_image_range(const RomfsProviderStage *s,
             result = ROMFS_PROVIDER_ERR_IMAGE_READ;
             break;
         }
-        aot_sha256_update(&ctx, buffer, (size_t)got);
+        result = hash_status(host_sha256_update(ctx, buffer, (size_t)got));
+        if (result != ROMFS_PROVIDER_OK) break;
         done += got;
     }
-    if (result == ROMFS_PROVIDER_OK) aot_sha256_final(&ctx, out);
+    if (result == ROMFS_PROVIDER_OK)
+        result = hash_status(host_sha256_finish(ctx, out));
+    else
+        host_sha256_abort(ctx);
     free(buffer);
     return result;
 }
@@ -314,10 +342,14 @@ static romfs_provider_status hash_image_range(const RomfsProviderStage *s,
 static romfs_provider_status hash_host_file(RomfsHostFile *file,
                                             uint64_t size, uint8_t out[32])
 {
-    AotSha256 ctx;
+    HostSha256 *ctx = NULL;
     uint8_t *buffer = (uint8_t *)malloc(ROMFS_HASH_BUFFER_BYTES);
     if (!buffer) return ROMFS_PROVIDER_ERR_ALLOCATION;
-    aot_sha256_init(&ctx);
+    romfs_provider_status begin = hash_status(host_sha256_begin(&ctx));
+    if (begin != ROMFS_PROVIDER_OK) {
+        free(buffer);
+        return begin;
+    }
     uint64_t done = 0;
     romfs_provider_status result = ROMFS_PROVIDER_OK;
     while (done < size) {
@@ -330,10 +362,14 @@ static romfs_provider_status hash_host_file(RomfsHostFile *file,
             result = ROMFS_PROVIDER_ERR_READ;
             break;
         }
-        aot_sha256_update(&ctx, buffer, (size_t)got);
+        result = hash_status(host_sha256_update(ctx, buffer, (size_t)got));
+        if (result != ROMFS_PROVIDER_OK) break;
         done += got;
     }
-    if (result == ROMFS_PROVIDER_OK) aot_sha256_final(&ctx, out);
+    if (result == ROMFS_PROVIDER_OK)
+        result = hash_status(host_sha256_finish(ctx, out));
+    else
+        host_sha256_abort(ctx);
     free(buffer);
     return result;
 }

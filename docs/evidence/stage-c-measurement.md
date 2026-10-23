@@ -78,3 +78,44 @@ Criterion (c) requires ≥ 50 % lower median `t_total` than legacy.
 
 Stage C as specified cannot pass gate (c); a decision is needed (see PROJECT_STATE / the lead's report).
 Steps 1.5 (40-iteration measurement) and 1.6 were not run.
+
+## 6. After the RomFS hash change (2026-10-23, user decisions 1 and 2a)
+
+Change: image/overlay hashing through the host CNG SHA-256 (`src/host_sha256.c`); full
+verification is still mandatory on every init (D020 amendment). Battery: 86/86 in Debug and
+Release, 0 warnings (adds `host_sha256`, `host_sha256_mutants`).
+
+Legacy, 6 iterations (`start-c3-legacy`): same admissions as before.
+
+| it | t_total | translate | compile | link | run |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 33.7 | 9.6 | 5.6 | 1.1 | 12.3 |
+| 1 | 22.6 | 9.1 | 1.1 | 1.0 | 9.1 |
+| 2 | 21.6 | 9.2 | 1.1 | 1.0 | 9.2 |
+| 3 | 21.4 | 9.1 | 1.1 | 1.0 | 9.1 |
+| 4 | 24.7 | 9.3 | 1.3 | 1.2 | 11.8 |
+| 5 | 24.5 | 9.2 | 1.1 | 1.1 | 11.9 |
+
+Steady median 22.6 s (was 53.6 s).
+
+Catalog + `--equivalence-check`, 8 iterations (`start-c3-catalog`): **8/8 EQUIV ok**, 0 REFUSED,
+same admissions (veneer, main#0 … main#6). Steady state (iterations 1–7): table 4.4–4.7 s,
+compile + link 2.3 s, run 12.3–12.8 s, equivalence re-run 23.7–24.9 s. Excluding the
+equivalence re-run, the time per admission is 20.1–22.2 s, median 20.8 s.
+
+Result under the restated gate (absolute time per admitted constructor):
+
+| backend | per admission (median) |
+|---|---:|
+| legacy, before hash change | 53.6 s |
+| legacy, after | 22.6 s |
+| catalog, after (no equivalence) | 20.8 s (≈ −8 % vs legacy) |
+
+Notes:
+- The catalog's Start run is consistently ~1.5–3 s slower than legacy's (12.6 vs 9.1–11.9 s).
+  Not explained; possibly the larger executable or file-cache interaction with the
+  interleaved equivalence run. Not investigated.
+- Remaining costs per admission: Start rerun (~10–12 s) and the main closure recomputation in
+  the table step (~4.5 s). Making the table incremental (option b) or resuming without a
+  restart (option c, needs a new decision) are the only further levers.
+- Not run: step 1.5's 40-iteration measurement and the D008 generated-code microbench.
