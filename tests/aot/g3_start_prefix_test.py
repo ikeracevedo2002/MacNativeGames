@@ -718,6 +718,11 @@ def main():
     base_src = b"int x;\n"
     flags0 = list(G.COMPILE_FLAGS)
     k0 = G.cache_key(base_src, flags0, "cl-19.44", "h0")
+    failures += check("cache_key separates identical bytes at two paths",
+                      G.cache_key(base_src, flags0, "cl-19.44", "h0",
+                                  "/a/x.c")
+                      != G.cache_key(base_src, flags0, "cl-19.44", "h0",
+                                     "/b/x.c"), True)
     failures += check("cache_key is stable for identical inputs",
                       G.cache_key(base_src, list(flags0), "cl-19.44", "h0"),
                       k0)
@@ -910,6 +915,9 @@ def main():
                           "BUILD compiled=0 reused=%d\n" % n)
         failures += check("identical rebuild only links", fake.events,
                           ["link"])
+        failures += check("obj_bytes counts only this build's objects",
+                          G.LAST_BUILD["obj_bytes"],
+                          sum(os.path.getsize(obj_of(k)) for k in idx))
 
         # 3. one source byte changed: exactly that source recompiled.
         _write(rpath("src/host_random.c"),

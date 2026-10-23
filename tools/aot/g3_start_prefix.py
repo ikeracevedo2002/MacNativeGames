@@ -545,7 +545,7 @@ COMPILE_FLAGS = ["/nologo", "/W4", "/WX", "/O2", "/std:c11", "/bigobj",
 HEADER_DIRS = ("src", "src/aot", "tests/aot")
 
 # Counters of the most recent build() (tests read them).
-LAST_BUILD = {"compiled": 0, "reused": 0}
+LAST_BUILD = {"compiled": 0, "reused": 0, "obj_bytes": None}
 _COMPILER_IDS = {}
 
 
@@ -573,10 +573,14 @@ def header_digest(repo):
     return h.hexdigest()
 
 
-def cache_key(source_bytes, flags, compiler_id, headers_sha):
+def cache_key(source_bytes, flags, compiler_id, headers_sha, src_path=None):
     doc = {"src": hashlib.sha256(source_bytes).hexdigest(),
            "flags": list(flags), "compiler": compiler_id,
            "headers": headers_sha}
+    if src_path is not None:
+        # The path reaches the object through __FILE__ (assert messages), so
+        # identical bytes at two paths must not share one object.
+        doc["path"] = os.path.normcase(os.path.abspath(src_path))
     canon = json.dumps(doc, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
@@ -732,6 +736,7 @@ def build(repo, work, args, desc, images, exe, config_c):
     repo = os.path.abspath(repo)
     LAST_BUILD["compiled"] = 0
     LAST_BUILD["reused"] = 0
+    LAST_BUILD["obj_bytes"] = None
     objdir = os.path.join(work, "obj")
     index_path = os.path.join(objdir, "cache.json")
     log_path = os.path.join(work, "build_start.log")
@@ -764,7 +769,7 @@ def build(repo, work, args, desc, images, exe, config_c):
         except OSError as exc:
             print("FAIL: cannot read build source: %s" % exc)
             return _build_result(False, 0.0, 0.0)
-        key = cache_key(data, COMPILE_FLAGS, cid, headers)
+        key = cache_key(data, COMPILE_FLAGS, cid, headers, src)
         obj = _obj_path(objdir, key)
         plan.append(obj)
         if key in seen:
@@ -785,6 +790,8 @@ def build(repo, work, args, desc, images, exe, config_c):
     t0 = time.perf_counter()
     if ok:
         ok = _link(work, args, exe, plan, log_path)
+    if ok:
+        LAST_BUILD["obj_bytes"] = sum(os.path.getsize(o) for o in set(plan))
     return _build_result(ok, t_compile, time.perf_counter() - t0)
 
 
@@ -1051,9 +1058,6 @@ def write_timing(path, records):
 
 def iteration_record(work, iteration, entries, imgs, exe, st, t, admitted):
     """One TIMING_KEYS record from main()'s per-phase clocks (seconds)."""
-    obj_sizes = [os.path.getsize(os.path.join(d, f))
-                 for d, _dirs, files in os.walk(os.path.join(work, "obj"))
-                 for f in files]
     stop = None
     if st is not None:
         stop = {k: st[k] for k in ("code", "src", "target", "status")}
@@ -1065,7 +1069,7 @@ def iteration_record(work, iteration, entries, imgs, exe, st, t, admitted):
         t_link=t["link"], t_run=t["run"], t_classify=t["classify"],
         t_total=t["total"],
         c_bytes={n: os.path.getsize(p) for n, p in imgs.items()},
-        obj_bytes=sum(obj_sizes) if obj_sizes else None,
+        obj_bytes=LAST_BUILD["obj_bytes"],
         exe_bytes=os.path.getsize(exe) if os.path.exists(exe) else None,
         steps=st["steps"] if st is not None else None,
         stop=stop, admitted=admitted))
