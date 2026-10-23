@@ -74,6 +74,10 @@ import g3_local_switch as LS    # noqa: E402
 SCHEMA_VERSION = 1
 KIND = "candidate-catalog"
 AUTHORITY = "none"
+# Receipt written only after a successful REGENERATE verification (plan 1.2.6).
+RECEIPT_KIND = "catalog-receipt"
+RECEIPT_SCHEMA = 1
+VERIFY_MODES = ("regenerate", "bound")
 # Disjoint fault_status namespaces used ONLY inside candidate bodies.  The
 # positive one sits far above any per-module unsupported ordinal of today's
 # path; the negative one is disjoint from LOCAL_SWITCH_STATUS_BASE's range,
@@ -460,14 +464,12 @@ def seal_catalog(meta, c_text):
     return out
 
 
-def verify_catalog(meta, c_text, flat, layout, guest_base, name, partial):
-    """Fail closed unless the catalog is self-consistent and current.
+def _verify_catalog_static(meta, c_text, flat, guest_base, name, partial):
+    """Fail closed unless the catalog is self-consistent, current and bound to
+    the caller's flat, guest base, partial flag and module name.
 
-    Beyond the pinned identity strings, the authority step trusts nothing the
-    catalog says about itself: every selected window must be the exact range
-    of an FDE re-derived from the flat, and the catalog is regenerated from
-    (flat, layout, windows) with the current tools; the regenerated C unit and
-    metadata must be identical to the supplied ones.
+    No FDE is re-derived and nothing is regenerated here.  -> the selected
+    (start, end) windows, sorted.
     """
     if not isinstance(meta, dict):
         raise EmitError("catalog-invalid", "catalog metadata is not an object")
@@ -516,6 +518,20 @@ def verify_catalog(meta, c_text, flat, layout, guest_base, name, partial):
         bounds = sorted((int(s, 16), int(e, 16)) for s, e in meta["selection"])
     except (KeyError, TypeError, ValueError) as exc:
         raise EmitError("catalog-invalid", "selection: %s" % exc)
+    return bounds
+
+
+def verify_catalog(meta, c_text, flat, layout, guest_base, name, partial):
+    """Fail closed unless the catalog is self-consistent and current.
+
+    Beyond the pinned identity strings, the authority step trusts nothing the
+    catalog says about itself: every selected window must be the exact range
+    of an FDE re-derived from the flat, and the catalog is regenerated from
+    (flat, layout, windows) with the current tools; the regenerated C unit and
+    metadata must be identical to the supplied ones.
+    """
+    bounds = _verify_catalog_static(meta, c_text, flat, guest_base, name,
+                                    partial)
     try:
         fmeta = F.read_module(flat, layout, layout.get("name") or name)
         _header, fdes, _end = F.parse_fdes(fmeta)
@@ -534,6 +550,60 @@ def verify_catalog(meta, c_text, flat, layout, guest_base, name, partial):
         raise EmitError("catalog-not-reproducible",
                         "regenerating the catalog from the flat and its "
                         "windows does not reproduce the supplied unit")
+
+
+def make_receipt(meta, c_text, flat, guest_base, name, partial):
+    """Receipt of a successful REGENERATE verification of this catalog.
+
+    A pure function of its inputs and the current tools.  It is evidence of a
+    regenerate verification only when the caller has just performed one (the
+    CLI writes it with `--write-receipt` after a successful table build).
+    """
+    return {"schema_version": RECEIPT_SCHEMA, "kind": RECEIPT_KIND,
+            "catalog_identity": meta["identity"],
+            "c_sha256": _sha(c_text.encode("utf-8")),
+            "meta_sha256": _sha(_canonical(meta)),
+            "flat_sha256": _sha(flat),
+            "guest_base": _hex(guest_base),
+            "module": name,
+            "partial": bool(partial),
+            "tools": tool_hashes(),
+            "selection": meta["selection"],
+            "verified_by": "regenerate"}
+
+
+def verify_catalog_bound(meta, c_text, flat, guest_base, name, partial,
+                         receipt):
+    """Hash-bound verification: the static checks, then the receipt.
+
+    NOT a regeneration: no FDE is re-derived and the catalog is not rebuilt.
+    The receipt must be exactly the receipt `make_receipt` computes now for
+    these inputs and the current tools, and must record a regenerate
+    verification.
+    """
+    _verify_catalog_static(meta, c_text, flat, guest_base, name, partial)
+    if not isinstance(receipt, dict):
+        raise EmitError("catalog-receipt-missing",
+                        "no catalog receipt object was supplied")
+    if receipt.get("schema_version") != RECEIPT_SCHEMA \
+            or receipt.get("kind") != RECEIPT_KIND:
+        raise EmitError("catalog-receipt-mismatch",
+                        "receipt schema/kind %r/%r (expected %d/%r)"
+                        % (receipt.get("schema_version"), receipt.get("kind"),
+                           RECEIPT_SCHEMA, RECEIPT_KIND))
+    if receipt.get("verified_by") != "regenerate":
+        raise EmitError("catalog-receipt-mismatch",
+                        "receipt verified_by %r; only a regenerate "
+                        "verification can be bound"
+                        % (receipt.get("verified_by"),))
+    expected = make_receipt(meta, c_text, flat, guest_base, name, partial)
+    if _canonical(receipt) != _canonical(expected):
+        differ = [k for k in sorted(set(receipt) | set(expected))
+                  if k not in receipt or k not in expected
+                  or _canonical(receipt[k]) != _canonical(expected[k])]
+        raise EmitError("catalog-receipt-mismatch",
+                        "receipt does not match this catalog and the current "
+                        "tools; differing field(s): %s" % ", ".join(differ))
 
 
 # ---------------------------------------------------------------- authority
@@ -647,13 +717,26 @@ def _table_entries(blocks, covered, catalog_meta):
 
 
 def build_table(flat, layout, guest_base, name, entries, catalog_meta,
-                catalog_c, partial=True):
-    """Authority step -> (table C text, image metadata, partition report)."""
+                catalog_c, partial=True, verify_mode="regenerate",
+                receipt=None):
+    """Authority step -> (table C text, image metadata, partition report).
+
+    `verify_mode="regenerate"` (default) re-derives and regenerates the catalog;
+    `verify_mode="bound"` checks `receipt` instead (see verify_catalog_bound).
+    """
     _check_name(name)
     _check_base(guest_base)
     flat = bytes(flat)
-    verify_catalog(catalog_meta, catalog_c, flat, layout, guest_base, name,
-                   partial)
+    if verify_mode not in VERIFY_MODES:
+        raise EmitError("verify-mode-invalid",
+                        "verify mode %r (expected one of %s)"
+                        % (verify_mode, ", ".join(VERIFY_MODES)))
+    if verify_mode == "bound":
+        verify_catalog_bound(catalog_meta, catalog_c, flat, guest_base, name,
+                             partial, receipt)
+    else:
+        verify_catalog(catalog_meta, catalog_c, flat, layout, guest_base, name,
+                       partial)
     entries = sorted(set(entries))
     if not entries:
         raise EmitError("no-entries", "the admitted root set is empty")
@@ -842,17 +925,42 @@ def main(argv=None):
     tab.add_argument("--catalog-c", dest="catalog_c", required=True)
     tab.add_argument("--report", default=None,
                      help="partition report JSON (also written on refusal)")
+    tab.add_argument("--verify-mode", dest="verify_mode", default="regenerate",
+                     choices=VERIFY_MODES,
+                     help="regenerate (default): re-derive and regenerate the "
+                          "catalog; bound: check --receipt only")
+    tab.add_argument("--receipt", default=None,
+                     help="catalog receipt JSON (required with --verify-mode "
+                          "bound)")
+    tab.add_argument("--write-receipt", dest="write_receipt", default=None,
+                     help="after a successful regenerate table build, write "
+                          "the catalog receipt here")
     args = ap.parse_args(argv)
+    if args.cmd == "table":
+        if args.verify_mode == "bound" and not args.receipt:
+            ap.error("--verify-mode bound requires --receipt")
+        if args.verify_mode == "bound" and args.write_receipt:
+            ap.error("--write-receipt is only valid with --verify-mode "
+                     "regenerate")
+        if args.verify_mode == "regenerate" and args.receipt:
+            ap.error("--receipt is only valid with --verify-mode bound")
 
     repo = os.path.dirname(os.path.dirname(_HERE))
+    is_table = args.cmd == "table"
     outs = [args.out_c, args.out_json] + (
-        [args.report] if args.cmd == "table" and args.report else [])
+        [args.report] if is_table and args.report else []) + (
+        [args.write_receipt] if is_table and args.write_receipt else [])
     for path in outs:
         if F.inside_tree(path, repo):
             ap.error("%r is inside the source tree; generated module code "
                      "must stay outside it (D006)" % path)
         if os.path.exists(path):
             os.remove(path)
+    # The receipt is an INPUT in bound mode: refuse an in-tree path, but never
+    # delete it.
+    if is_table and args.receipt and F.inside_tree(args.receipt, repo):
+        ap.error("%r is inside the source tree; a catalog receipt must stay "
+                 "outside it (D006)" % args.receipt)
     try:
         with open(args.flat, "rb") as handle:
             flat = handle.read()
@@ -869,6 +977,15 @@ def main(argv=None):
     except (OSError, ValueError, T.DecodeError) as exc:
         sys.stderr.write("g3_fde_emit: input error: %s\n" % exc)
         return 1
+    receipt = None
+    if is_table and args.verify_mode == "bound":
+        try:
+            receipt = _read_json(args.receipt)
+        except (OSError, ValueError) as exc:
+            sys.stdout.write("REFUSED catalog-receipt-missing\n")
+            sys.stderr.write("g3_fde_emit: receipt %s is unreadable: %s\n"
+                             % (args.receipt, exc))
+            return 2
     partial = not args.strict
     try:
         if args.cmd == "catalog":
@@ -878,7 +995,9 @@ def main(argv=None):
         else:
             text, meta, report = build_table(flat, layout, guest_base,
                                              args.name, entries, catalog_meta,
-                                             catalog_c, partial)
+                                             catalog_c, partial,
+                                             verify_mode=args.verify_mode,
+                                             receipt=receipt)
     except PartitionMismatch as exc:
         if args.report:
             _write(args.report, _json_bytes(exc.report))
@@ -894,6 +1013,10 @@ def main(argv=None):
     if args.cmd == "table":
         if args.report:
             _write(args.report, _json_bytes(report))
+        if args.write_receipt:
+            # Only reached after a successful regenerate verification.
+            _write(args.write_receipt, _json_bytes(make_receipt(
+                catalog_meta, catalog_c, flat, guest_base, args.name, partial)))
         print("%s: %d closure blocks, %d from the catalog, %d emitted, %d "
               "catalog block(s) compiled but not admitted"
               % (args.name, report["closure_blocks"],

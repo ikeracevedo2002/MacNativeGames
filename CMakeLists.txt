@@ -1639,6 +1639,17 @@ if(MN_BUILD_AOT_PROOF)
     set_tests_properties(aot_g3_fde_emit PROPERTIES TIMEOUT 600
         ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
 
+    # D024 plan 1.2.6: hash-bound catalog verification (`table --verify-mode
+    # bound --receipt`). Hermetic (no game data, no MSVC): the same fixture
+    # as aot_g3_fde_emit, through the real CLI; bound output must equal the
+    # regenerate output and every tampered receipt must be refused.
+    add_test(NAME aot_g3_fde_emit_receipt
+        COMMAND "${AOT_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/tests/aot/g3_fde_emit_receipt_test.py"
+                --llvm "${AOT_LLVM_BIN_DIR}")
+    set_tests_properties(aot_g3_fde_emit_receipt PROPERTIES TIMEOUT 300
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
     # Native + Unicorn A57 differential of the emitted local-switch guard:
     # compiles the ACTUAL generated C for four variants with MSVC /W4 /WX /O2
     # in an external temp dir and direct-calls the translated basic blocks

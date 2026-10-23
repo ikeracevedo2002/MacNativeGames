@@ -1033,5 +1033,12 @@ output for those closures is byte-identical to the previous translator except th
 Not executed on real data: no existing real-exec harness accepts a catalog+table pair. No timing claim
 (Stage C).
 
+Stage C prerequisite (hash-bound verification): `table --verify-mode bound --receipt` checks a hash binding
+(catalog identity, C and metadata hashes, flat, base, name, partial, tool hashes, selection) against a receipt
+that only a successful `--verify-mode regenerate --write-receipt` run writes. Bound mode skips FDE
+re-derivation and catalog regeneration, so it is a hash check, not a regeneration, and it is valid only for
+the toolchain state that wrote the receipt. Pending Windows validation (`aot_g3_fde_emit` and the CTest
+battery); the hermetic `aot_g3_fde_emit_receipt` covers only the Linux-side logic.
+
 Consequences: G3 constructor progress is pursued by the frontend/build experiment (PORTING_PLAN Phase 2)
 before any new root heuristic. No exit condition changes.
